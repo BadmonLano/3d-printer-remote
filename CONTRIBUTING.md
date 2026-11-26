@@ -20,4 +20,6 @@ python -m unittest discover -s bots/tests -v
 python -m py_compile bots/printer_remote.py
 ```
 
+Optional: `pip install -r requirements-dev.txt` adds pytest, and then `python -m pytest bots/tests` works too.
+
 Say what changed, why, and how you tested it (and on which printer / Creality Print version if you used hardware).

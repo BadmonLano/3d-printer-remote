@@ -1,5 +1,6 @@
 """Offline test suite: fake slicer, fake printer (HTTP upload + ws 9999), fake camera, fake Telegram.
 No network beyond 127.0.0.1, no hardware. Run:  python -m unittest discover -s bots/tests -v
+(optional: pip install -r requirements-dev.txt, then python -m pytest bots/tests)
 """
 from __future__ import annotations
 

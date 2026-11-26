@@ -1,6 +1,6 @@
 {
   "name": "3d-printer-remote",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Agent bridge for Creality Print 7.2 and a Creality CR-10 SE. Not yet hardware-verified on a CR-10 SE (printer protocol from K1-family firmware; tests use a fake printer). Your AI agent detects the slicer, edits copies of presets, slices 3MF/STL from the command line, checks bed fit, reads live printer data, runs a print queue with filament swaps, tracks history, cost, filament and maintenance, and watches prints with a camera. Physical actions (start, pause, resume, cancel, heat, home, move, fan, cooldown, filament extrude/retract/load/unload) run only after the owner says yes in chat and an automatic preflight check passes. The one exception is an urgent cooldown (heaters off) for jams, runaway heat or crashes.",
   "author": {
     "name": "Bentayga Empire LLC",

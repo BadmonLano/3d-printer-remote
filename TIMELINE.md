@@ -2,6 +2,10 @@
 
 Version history, newest first. Details: [CHANGELOG.md](CHANGELOG.md).
 
+## v1.2.2: slice origin fix and real-print notes
+- Creality Print 7.2 settings-file origin fix, print-quality skill checklist, unittest docs,
+  and hardware notes for retract, unload, extrude and an owner-approved start.
+
 ## v1.2.1: urgent cooldown
 - Heaters-off without asking, for urgent cases only; real printer address out of tracked files.
 

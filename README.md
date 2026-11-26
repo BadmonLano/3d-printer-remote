@@ -4,8 +4,9 @@
 
 > **Not yet hardware-verified on a CR-10 SE** for uploads and most physical actions (start, pause, heat, move...). The
 > slicer side was checked on a real Creality Print 7.2 install, and read-only live data (status, files, history,
-> config, mesh) was checked on a real CR-10 SE, plus one owner-approved `filament retract`. See
-> [docs/LIMITS.md](docs/LIMITS.md).
+> config, mesh) was checked on a real CR-10 SE. Owner-approved real runs on a CR-10 SE have also been done:
+> `filament retract` 10 mm, `filament unload` 80 mm and `filament extrude` 30 mm, all with the 300 C purge, no errors.
+> See [docs/LIMITS.md](docs/LIMITS.md).
 
 A bridge between your AI agent and **Creality Print 7.2** plus a **Creality CR-10 SE** (Creality OS, Klipper based,
 built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Python CLI and reads its JSON.
@@ -108,10 +109,19 @@ data. `printer stream --jsonl` prints one JSON line per update, then a `summary`
 Owner packets: `owner_inbox/printer_remote - <subject>_<YYYYMMDD_HHMMSS>.json`, written as `.tmp` then renamed, with
 `id, type, received_at (ET), lane, priority, context{summary, output, status}`.
 
+## Tests
+
+```
+python -m unittest discover -s bots/tests -v
+```
+
+Standard library only, offline (fake slicer, printer, camera and Telegram), no hardware needed. Optional: `pip install -r requirements-dev.txt` adds pytest, and then `python -m pytest bots/tests` works too.
+
 ## Honest limits
 
-See [docs/LIMITS.md](docs/LIMITS.md). In short: the printer protocol isn't verified on a CR-10 SE; the camera checks
-are simple image diffs that lighting can fool; the Creality Print CLI crashes on some 7.x builds (issue #574).
+See [docs/LIMITS.md](docs/LIMITS.md). In short: some physical actions are verified on a real CR-10 SE (filament
+moves and an owner-approved start) and others are not; the camera checks are simple image diffs that lighting can
+fool; the Creality Print CLI crashes on some 7.x builds (issue #574).
 
 ## Credits
 

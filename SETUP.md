@@ -28,7 +28,8 @@
    `APPROVAL_TELEGRAM=true` also sends approval requests there.
 9. **Agent.** Point your agent at `skills/printer-remote/SKILL.md`. Paste `automations/printer_watch.automation.md`
    as a recurring job if you want print watching.
-10. **Tests:** `python -m unittest discover -s bots/tests -v` (offline: fake slicer, printer, camera and Telegram).
+10. **Tests:** `python -m unittest discover -s bots/tests -v` (offline: fake slicer, printer, camera and Telegram; no
+    extra installs). Optional: `pip install -r requirements-dev.txt` adds pytest, and then `python -m pytest bots/tests` works too.
 
 | env | needed | what |
 |---|---|---|

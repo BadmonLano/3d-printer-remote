@@ -69,5 +69,17 @@ Unit: model `F003`, firmware string `DWIN hw ver:F003;DWIN sw ver:V1.1.0.28`, Wi
   24.1 C to 296+ C in about 80 s (about 5 C/s at its fastest), reached 300 C, `M83` / `G1 E-10 F120` / `M82` were
   accepted, and `M104 S0` set the target back to 0. 97 s total. 30 s later the nozzle read 222 C with target 0, idle,
   no error. Pushes arrive every ~2 s while heating.
-- **Not tried yet:** upload, start, pause, resume, cancel, heat (as its own command), home, move, fan, light,
-  extrude, load, unload.
+- **Owner-approved `filament unload` (2026-11-26, ~2:00 PM ET, 300 C purge):** heated to 300 C in about 77 s, pushed
+  5 mm, pulled 80 mm (chunked), `M104 S0`. Nozzle read 226 C with target 0 shortly after, no error. The owner
+  confirmed the filament came out.
+- **Owner-approved `filament extrude --mm 30 --temp 300` (2026-11-26 2:09 PM ET):** preflight passed (state read
+  "cancelled", left over from an earlier job, which counts as idle; nozzle 37.5 C, bed 23.5 C, err 0). `M104 S300` at
+  1.5 s, 300 C reached at 76.4 s (37 -> 150 C by ~30 s, 260 C by ~61 s), `M83` / `G1 E30 F180` / `M82` at 81.4 s, the
+  nozzle held 299-302 C during the push, `M104 S0` at 93.4 s, 96.4 s total. 10 s later: nozzle 276 C, target 0, bed
+  23.6 C, no error. Filament sensor is off, so flow out of the nozzle is confirmed by eye only.
+- **Owner-approved `printer start` (2026-11-26):** preflight passed (no camera, so no bed check). Creality OS ran
+  its own home/probe first (nozzle 150 C then 200 C wipe, then 140 C, heater off while probing with the bed at 60 C),
+  then the slicer's heat commands, with first layer about 8 minutes in. The printer's remaining-time field was wrong
+  at layer 1.
+- **Not tried yet:** upload, pause, resume, cancel, heat (as its own command), home, move, fan, light, load,
+  urgent cooldown.

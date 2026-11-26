@@ -46,7 +46,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 BOT = "printer_remote"
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -636,6 +636,43 @@ def parse_gcode_stats(path: Path) -> dict:
     return st
 
 
+def _system_root(name: str, idx: dict, ptype: str) -> str | None:
+    """Nearest system/bundled ancestor name of a preset (itself if it is one)."""
+    seen = 0
+    cur = name
+    while cur and seen < 20:
+        try:
+            meta = find_preset(cur, idx, ptype)
+        except Fail:
+            return None
+        if meta.get("source") in ("system", "bundled"):
+            return meta["name"]
+        cur = meta.get("inherits")
+        seen += 1
+    return None
+
+
+def _mark_origin(j: dict, name: str, idx: dict, ptype: str) -> None:
+    """Creality Print 7.2's CLI checks process/filament compatible_printers against the
+    printer's *system* name: from == "system" -> its name, else its "inherits". A flattened
+    preset with from=User and no inherits fails with "process not compatible with printer".
+    So: system presets stay from=system; user presets keep from=User + inherits=<system root>."""
+    root = _system_root(name, idx, ptype)
+    try:
+        src = find_preset(name, idx, ptype).get("source")
+    except Fail:
+        src = None
+    if src in ("system", "bundled"):
+        j["from"] = "system"
+        j.pop("inherits", None)
+    else:
+        j["from"] = "User"
+        if root:
+            j["inherits"] = root
+        else:
+            j.pop("inherits", None)
+
+
 def build_settings_files(work: Path, printer: str, process: str, filaments: list[str], overrides: dict) -> tuple[list, list]:
     idx = index_presets()
     files = []
@@ -644,14 +681,14 @@ def build_settings_files(work: Path, printer: str, process: str, filaments: list
         if t == "process":
             for k, v in overrides.items():
                 j[k] = coerce_value(j.get(k), v)
-        j["from"] = "User"
+        _mark_origin(j, name, idx, t)
         p = work / f"{t}_{safe_name(j.get('name', name))}.json"
         atomic_write(p, json.dumps(j, indent=4))
         files.append(str(p))
     fils = []
     for fname in filaments:
         j = resolve_preset(fname, idx, "filament")
-        j["from"] = "User"
+        _mark_origin(j, fname, idx, "filament")
         p = work / f"filament_{safe_name(j.get('name', fname))}.json"
         atomic_write(p, json.dumps(j, indent=4))
         fils.append(str(p))

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.2
+- Docs: the test command is `python -m unittest discover -s bots/tests -v` (README, SETUP, CONTRIBUTING, SKILL).
+  `python -m pytest bots/tests` failed on a fresh clone because pytest wasn't installed; it's now optional through the
+  new `requirements-dev.txt`.
+- Fix: `slice` with clone/user presets failed on Creality Print 7.2 ("process not compatible with printer"). Settings
+  files now keep `from: system` for system presets and `inherits: <system root>` for user ones. First real CLI slice
+  done (a test plate, GUI open, separate output dir). Test: `bots/tests/test_slice_origin.py`.
+- Skill: new "Print quality / settings checklist" (published CR-PETG / CR-10 SE values with sources, kids-toy rules,
+  CLI gotchas, what the SE start sequence looks like, live progress via `printer stream`).
+- First real print started through the approval flow (owner yes in chat, preflight passed; no camera, so no bed check).
+
 ## 1.2.1
 - `printer cooldown --urgent --reason "..." [--fan]`: heaters off right away (nozzle 0, bed 0, optional part fan max),
   with no owner yes. It's for urgent cases only (jam, burning smell, runaway or printer error, crash on camera, the owner
