@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/printer_remote_logo.png" alt="3D Printer Remote" width="640"></p>
+
 # 3D Printer Remote
 
 > **Not yet hardware-verified on a CR-10 SE** for uploads and most physical actions (start, pause, heat, move...). The
