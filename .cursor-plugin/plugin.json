@@ -1,0 +1,25 @@
+{
+  "name": "3d-printer-remote",
+  "version": "1.1.0",
+  "description": "Agent bridge for Creality Print 7.2 and a Creality CR-10 SE. Not yet hardware-verified on a CR-10 SE (printer protocol from K1-family firmware; tests use a fake printer). Your AI agent detects the slicer, edits copies of presets, slices 3MF/STL from the command line, checks bed fit, reads live printer data, runs a print queue with filament swaps, tracks history, cost, filament and maintenance, and watches prints with a camera. Physical actions (start, pause, resume, cancel, heat, home, move, fan) run only after the owner says yes in chat and an automatic preflight check passes.",
+  "author": {
+    "name": "Bentayga Empire LLC",
+    "url": "https://github.com/BadmonLano"
+  },
+  "homepage": "https://github.com/BadmonLano/3d-printer-remote",
+  "repository": "https://github.com/BadmonLano/3d-printer-remote",
+  "license": "MIT",
+  "keywords": [
+    "3d printing",
+    "creality print",
+    "cr-10 se",
+    "slicer cli",
+    "klipper",
+    "camera",
+    "owner approval"
+  ],
+  "logo": "assets/logo.png",
+  "skills": [
+    "skills/printer-remote"
+  ]
+}

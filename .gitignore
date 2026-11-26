@@ -1,0 +1,61 @@
+# secrets / local config
+.env
+bots/.env
+*.env
+!.env.example
+*.pem
+*.key
+
+# owner runtime (folders ship empty with .gitkeep)
+inbox/*
+inbox_results/**
+!inbox_results/**/
+owner_inbox/*
+owner_inbox_archive/
+_backup/
+
+# local, owner-specific agent copy (never ship; the generic skill lives in skills/)
+jordan/
+rules/*
+!rules/rules.example.md
+learnings/*
+!learnings/README.md
+!learnings/LEARNINGS.template.md
+
+# 3D Printer Remote runtime: state, logs, comms, confirm codes, snapshots, gcode, backups
+bots/state/
+bots/logs/
+bots/comms/
+*.jsonl
+*.log
+*.lock
+*.gcode
+
+# python / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# backups / internal notes (never ship)
+*.bak
+*.bak_*
+backups/
+**/backups/
+_archive/
+_backup/
+
+# local, owner-specific agent copy (never ship; the generic skill lives in skills/)
+jordan/
+
+# folder placeholders ship (keep last so it wins)
+!**/.gitkeep

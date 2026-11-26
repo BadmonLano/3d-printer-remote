@@ -1,0 +1,5 @@
+# 3D Printer Remote (Python 3.12+)
+# Core CLI is standard library only: slicing, presets, LAN upload, websocket, confirm gate, Telegram alerts.
+# Optional (camera): timestamp burn-in on snapshots, empty-bed check and frame-diff watch.
+pillow>=10
+numpy>=1.26
