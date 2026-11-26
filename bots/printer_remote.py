@@ -10,7 +10,9 @@ Free (no confirm): detect, presets, slice, open, split-check, gcode inspect, que
                    recommend, plates, timelapse, health, printer discover/probe/status/stream/latest/info/files/...,
                    printer upload, read-only gcode queries, camera, watch (observe + alert).
 Gated (owner yes in chat): printer start / pause / resume / cancel / heat / home / move / fan / cooldown,
-    filament extrude / retract / load / unload (300 C preheat by default), non-read-only gcode.
+    filament extrude / retract / load / unload (preheat follows the material; PETG 240 default; --purge = 300 C),
+    non-read-only gcode.
+    Exception: `printer cooldown --urgent --reason ...` (heaters off now, no owner yes) for urgent cases only.
     First call -> request + summary, status "awaiting_owner". The owner answers YES/NO in chat.
     `approve <request_id> --yes|--no` records it; on yes an automatic preflight runs and the action executes
     only if preflight passes. Agents pass along only the owner's own answer, never their own.
@@ -44,7 +46,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BOT = "printer_remote"
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -72,6 +74,8 @@ class Fail(RuntimeError):
 
 
 def load_env() -> None:
+    if os.environ.get("PR_NO_DOTENV") == "1":  # tests: never pick up the owner's local .env
+        return
     for f in (ROOT / ".env", HERE / ".env"):
         if not f.is_file():
             continue
@@ -1081,6 +1085,14 @@ def cmd_printer(a, out):
         if not out["printer_ip"]:
             out["warnings"].append("no IP found; set PRINTER_IP in .env")
         return
+    if getattr(a, "urgent", False):
+        if sub != "cooldown":
+            raise Fail("--urgent only applies to `printer cooldown`; everything else needs the owner's yes")
+        rec = urgent_cooldown(a.reason, "cli", fan=a.fan)
+        out.update(urgent_cooldown=rec, action="cooldown")
+        if not rec["ok"]:
+            raise Fail(f"urgent cooldown could not reach the printer: {rec.get('error')}. Switch it off at the power switch.")
+        return
     if sub in GATED_ACTIONS:
         return request_gated(sub, a, out)
     if sub in PRINTER_QUERIES or sub in ("info", "light", "gcode"):
@@ -1215,8 +1227,8 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
     if action == "heat":
         if a.nozzle is None and a.bed is None:
             raise Fail("heat needs --nozzle and/or --bed (0 turns it off)")
-        if a.nozzle is not None and not (0 <= a.nozzle <= 260):
-            raise Fail("nozzle target must be 0-260 C")
+        if a.nozzle is not None and not (0 <= a.nozzle <= nozzle_max_c()):
+            raise Fail(f"nozzle target must be 0-{nozzle_max_c():.0f} C")
         if a.bed is not None and not (0 <= a.bed <= 100):
             raise Fail("bed target must be 0-100 C")
         params.update(nozzle=a.nozzle, bed=a.bed)
@@ -1251,6 +1263,9 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
             summary += f". FILAMENT SWAP: {params['swap_note']}"
     if action == "heat":
         summary += f" (nozzle {params['nozzle']}, bed {params['bed']})"
+        if (params.get("nozzle") or 0) > NOZZLE_NORMAL_MAX_C:
+            summary += f". NOTE: nozzle above {NOZZLE_NORMAL_MAX_C} C is purge territory, not normal printing"
+            out["warnings"].append(f"nozzle {params['nozzle']} C is above the normal {NOZZLE_NORMAL_MAX_C} C printing ceiling")
     if action == "move":
         summary += f" ({params['desc']})"
     if action == "gcode":
@@ -1453,15 +1468,41 @@ def move_params(a) -> dict:
             "desc": ("relative " if a.relative else "to ") + g1[3:]}
 
 
+# Nozzle temperatures for filament moves, per material (middle of common published ranges: PLA 190-220,
+# PETG 230-250, ABS 230-260, ASA 240-260, TPU 210-230). 300 C is only for an explicit hardened-filament purge.
+MATERIAL_PREHEAT_C = {"PLA": 210, "PETG": 240, "ABS": 245, "ASA": 250, "TPU": 225}
+NOZZLE_HARD_MAX_C = 300     # shared ceiling for every nozzle command (printer reports 320; stock hotend rated ~300)
+NOZZLE_NORMAL_MAX_C = 260   # normal printing ceiling; above this `printer heat` warns (purge territory)
+
+
+def nozzle_max_c() -> float:
+    return min(env_float("FILAMENT_MAX_C", NOZZLE_HARD_MAX_C), NOZZLE_HARD_MAX_C)
+
+
+def filament_preheat(a) -> tuple[float, str]:
+    """--temp > --purge > --material > FILAMENT_PREHEAT_C > FILAMENT_MATERIAL > PETG."""
+    if getattr(a, "temp", None):
+        return float(a.temp), "--temp"
+    if getattr(a, "purge", False):
+        return env_float("FILAMENT_PURGE_C", 300), "purge (hardened filament)"
+    mat = getattr(a, "material", None)
+    if not mat and env("FILAMENT_PREHEAT_C"):
+        return env_float("FILAMENT_PREHEAT_C", 240), "FILAMENT_PREHEAT_C"
+    mat = (mat or env("FILAMENT_MATERIAL") or "PETG").upper()
+    if mat not in MATERIAL_PREHEAT_C:
+        raise Fail(f"unknown material {mat}; use one of {', '.join(MATERIAL_PREHEAT_C)} or --temp")
+    return float(MATERIAL_PREHEAT_C[mat]), mat
+
+
 FILAMENT_CHUNK_MM = 45.0  # Klipper's default max_extrude_only_distance is 50 mm per move
 
 
 def filament_move_params(action: str, a) -> dict:
-    """Preheat (default 300 C, the owner's way: melts hardened filament in the tip), then move filament."""
-    temp = float(getattr(a, "temp", None) or env_float("FILAMENT_PREHEAT_C", 300))
-    tmax = min(env_float("FILAMENT_MAX_C", 320), 320)
+    """Preheat for the material (PETG 240 default; --purge / --temp for 300 C), then move filament."""
+    temp, temp_source = filament_preheat(a)
+    tmax = nozzle_max_c()
     if not (180 <= temp <= tmax):
-        raise Fail(f"preheat must be 180-{tmax:.0f} C")
+        raise Fail(f"preheat must be 180-{tmax:.0f} C (asked {temp:g} C)")
     mm = getattr(a, "mm", None)
     if action == "extrude":
         if mm is None:
@@ -1497,9 +1538,10 @@ def filament_move_params(action: str, a) -> dict:
             chunks.append(round(c if m > 0 else -c, 3))
             left -= c
     hold = bool(getattr(a, "hold", False))
-    desc = (f"heat nozzle to {temp:g} C, " + ", ".join(f"{'push' if m > 0 else 'pull'} {abs(m):g} mm" for m in moves)
+    desc = (f"heat nozzle to {temp:g} C ({temp_source}), " + ", ".join(f"{'push' if m > 0 else 'pull'} {abs(m):g} mm" for m in moves)
             + f" at {speed:g} mm/s, then " + ("hold the nozzle at temperature" if hold else "nozzle off"))
-    return {"temp": temp, "moves": moves, "chunks": chunks, "speed_mm_s": speed, "hold": hold, "desc": desc}
+    return {"temp": temp, "temp_source": temp_source, "moves": moves, "chunks": chunks, "speed_mm_s": speed,
+            "hold": hold, "desc": desc}
 
 
 def run_filament_move(cfg: dict, action: str, params: dict) -> dict:
@@ -1571,9 +1613,12 @@ def run_filament_move(cfg: dict, action: str, params: dict) -> dict:
         pump(sum(abs(c) for c in params["chunks"]) / params["speed_mm_s"] + 2)
         ok = True
         result["moved_mm"] = sum(params["moves"])
+    except Exception as e:
+        result["failure"] = str(e)[:200]
+        raise
     finally:
         try:
-            if not (ok and params.get("hold")):
+            if ok and not params.get("hold"):
                 send("M104 S0")
                 result["nozzle_target_set_to"] = 0
                 try:
@@ -1581,16 +1626,53 @@ def run_filament_move(cfg: dict, action: str, params: dict) -> dict:
                 except Fail:
                     pass
         except OSError:
-            # socket gone: one more try on a fresh connection
-            ws_exchange(cfg, [{"method": "set", "params": {"gcodeCmd": "M104 S0"}}], wait=1)
-            sent.append({"t_s": round(time.monotonic() - t0, 1), "gcode": "M104 S0 (reconnect)"})
-            result["nozzle_target_set_to"] = 0
+            ok = False  # socket gone: fall through to the urgent cooldown below
         ws.close()
+        if not ok:  # heat timeout, printer error, lost connection...: same urgent cooldown as everything else
+            uc = urgent_cooldown(f"filament {action} did not finish: {result.get('failure', 'connection lost')}",
+                                 "filament_failure", cfg=cfg)
+            result["urgent_cooldown"] = uc
+            result["nozzle_target_set_to"] = 0 if uc.get("ok") else None
+            sent.extend({"t_s": round(time.monotonic() - t0, 1), "gcode": g} for g in uc["sent"])
         result.update(sent=sent, timeline=timeline, total_s=round(time.monotonic() - t0, 1), completed=ok)
-        if not ok:
-            write_packet(f"filament {action} stopped", "result", f"Filament {action} stopped; nozzle set to 0.",
-                         result, "error", priority="high")
     return result
+
+
+def urgent_cooldown(reason: str, source: str, fan: bool = False, cfg: dict | None = None) -> dict:
+    """Urgent cooldown: heaters off NOW, no owner yes. Only for urgent cases (jam, burning smell, thermal runaway or
+    printer error, spaghetti/crash on camera, owner says stop/kill heat, hot nozzle left after a failure).
+    It deliberately ignores PHYSICAL_ACTIONS_ENABLED: it only removes heat (the safe direction), and the kill switch
+    exists to stop actions that add risk. It never moves, starts or heats anything. Logged to owner_inbox + safety log."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise Fail("urgent cooldown needs --reason")
+    cfg = cfg or printer_cfg()
+    gcode = ["M104 S0", "M140 S0"] + (["M106 S255"] if fan else [])
+    rec = {"at": ts_human(), "source": source, "reason": reason[:300], "sent": gcode}
+    try:
+        reply = ws_exchange(cfg, [{"method": "set", "params": {"gcodeCmd": g}} for g in gcode], wait=2)
+        rec["ok"] = True
+        rec["printer_reply"] = {k: reply.get(k) for k in ("err", "targetNozzleTemp", "targetBedTemp0") if k in reply}
+    except Exception as e:  # report loudly; the owner must kill power if the printer can't be reached
+        rec["ok"] = False
+        rec["error"] = str(e)[:200]
+    log = load_store("safety_log", [])
+    log.append(rec)
+    save_store("safety_log", log[-500:])
+    job = open_job()
+    if job:
+        hist = load_store("history", [])
+        for h in hist:
+            if h.get("id") == job["id"]:
+                h.setdefault("events", []).append({"urgent_cooldown": rec["at"], "reason": rec["reason"], "source": source})
+        save_store("history", hist)
+        rec["history_id"] = job["id"]
+    msg = (f"URGENT COOLDOWN {rec['at']} ({source}): {rec['reason']}. Nozzle and bed set to 0"
+           + (", part fan max" if fan else "") + "." if rec["ok"] else
+           f"URGENT COOLDOWN FAILED {rec['at']} ({source}): {rec['reason']}. Could not reach the printer "
+           f"({rec.get('error')}). Switch the printer off at the power switch.")
+    rec["packet"] = str(write_packet("URGENT cooldown", "alert", msg, rec, "ok" if rec["ok"] else "error", priority="high"))
+    return rec
 
 
 def execute_physical(action: str, params: dict) -> dict:
@@ -1931,6 +2013,13 @@ def watch_tick(out: dict) -> dict:
                 text += f" | Pause? Reply YES or NO (request {sub.get('request_id')})"
             except Fail as e:
                 action = {"pause_requested": False, "reason": str(e)}
+        hot = [x["kind"] for x in fresh if x["kind"].endswith(("_temp_runaway", "_heating_without_target"))
+               or x["kind"] == "printer_error"]
+        crash_paused = action.get("auto_paused") and any(x["kind"] == "big_frame_change" for x in fresh)
+        if env_bool("AUTO_COOLDOWN_ON_ANOMALY", False) and (hot or crash_paused):
+            action["urgent_cooldown"] = urgent_cooldown(f"malfunction watch: {', '.join(hot) or 'big frame change after auto-pause'}",
+                                                        "watch")
+            text += " | URGENT COOLDOWN sent (AUTO_COOLDOWN_ON_ANOMALY=true)"
         pkt = write_packet(f"ALERT {kinds}", "alert", text,
                            {"anomalies": fresh, "snapshot": snap, "status": status, **action}, "alert", priority="high")
         result["alerted"] = fresh
@@ -2205,6 +2294,8 @@ def inventory_check(material: str | None, color: str | None, grams: float | None
 
 
 def cmd_filament(a, out):
+    if getattr(a, "urgent", False):
+        raise Fail("--urgent only applies to `printer cooldown`; everything else needs the owner's yes")
     if a.filament_cmd in FILAMENT_MOVES:
         return request_gated(a.filament_cmd, a, out)
     inv = load_store("inventory", [])
@@ -2870,7 +2961,10 @@ def build_parser() -> argparse.ArgumentParser:
     for n in ("discover", "probe", "status", "latest", "pause", "resume", "cancel", "home", "info",
               "files", "history", "mesh", "objects", "timelapses", "config", "ota", "materials"):
         ps.add_parser(n)
-    ps.add_parser("cooldown", help="gated: nozzle and bed targets to 0")
+    x = ps.add_parser("cooldown", help="nozzle + bed to 0: owner yes, or --urgent --reason for urgent cases")
+    x.add_argument("--urgent", action="store_true", help="urgent only (jam, burning smell, runaway, crash...): no owner yes")
+    x.add_argument("--reason", help="why it is urgent (required with --urgent)")
+    x.add_argument("--fan", action="store_true", help="with --urgent: part fan to max too")
     x = ps.add_parser("move", help="gated: jog the head (absolute within the bed, or --relative up to 50 mm)")
     for ax in ("x", "y", "z"):
         x.add_argument(f"--{ax}", type=float)
@@ -2898,6 +2992,9 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--nozzle", type=float)
     x.add_argument("--bed", type=float)
 
+    for name, sub_p in ps.choices.items():  # --urgent is cooldown-only; elsewhere it is accepted and refused clearly
+        if name != "cooldown":
+            sub_p.add_argument("--urgent", action="store_true", help=argparse.SUPPRESS)
     x = sp.add_parser("approve", help="record the OWNER's yes/no for a request; yes runs preflight, then executes")
     x.add_argument("request_id")
     g = x.add_mutually_exclusive_group(required=True)
@@ -2959,8 +3056,11 @@ def build_parser() -> argparse.ArgumentParser:
         y = fp.add_parser(n, help=h)
         y.add_argument("--mm", type=float, help="filament length (extrude/retract required)")
         y.add_argument("--speed", type=float, help="mm/s (default 3)")
-        y.add_argument("--temp", type=float, help="preheat C (default FILAMENT_PREHEAT_C=300, max 320)")
+        y.add_argument("--temp", type=float, help="preheat C (max 300)")
+        y.add_argument("--material", help="PLA 210 / PETG 240 (default) / ABS 245 / ASA 250 / TPU 225")
+        y.add_argument("--purge", action="store_true", help="hardened-filament purge: preheat 300 C")
         y.add_argument("--hold", action="store_true", help="keep the nozzle hot afterwards (default: nozzle off)")
+        y.add_argument("--urgent", action="store_true", help=argparse.SUPPRESS)  # refused: urgent is cooldown-only
     y = fp.add_parser("check")
     y.add_argument("--material")
     y.add_argument("--color")

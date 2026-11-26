@@ -204,7 +204,7 @@ class TestWithPrinter(PrinterBase):
         self.assertIn("historyList", o["reply"])
         o = self.run_cli("printer", "info")
         self.assertEqual(o["info"]["model"], "F003")
-        self.assertEqual(o["info"]["creality_print_saved"][0]["address"], "10.9.9.9")
+        self.assertEqual(o["info"]["creality_print_saved"][0]["address"], "192.0.2.10")
 
     def test_gcode_console_gate(self):
         o = self.run_cli("printer", "gcode", "M105")
@@ -291,11 +291,12 @@ class TestFilamentMoves(PrinterBase):
         self.assertEqual(self.run_cli("filament", "extrude")["status"], "error")
         self.assertEqual(self.run_cli("filament", "extrude", "--mm", "150")["status"], "error")
         self.assertEqual(self.run_cli("filament", "retract", "--mm", "10", "--temp", "330")["status"], "error")
+        self.assertEqual(self.run_cli("filament", "retract", "--mm", "10", "--temp", "301")["status"], "error")
         self.assertEqual(self.run_cli("filament", "retract", "--mm", "10", "--speed", "50")["status"], "error")
         o = self.run_cli("filament", "retract", "--mm", "10")
         self.assertEqual(o["status"], "awaiting_owner", o)
-        self.assertEqual(o["params"]["temp"], 300.0)
-        self.assertIn("heat nozzle to 300 C", o["summary"])
+        self.assertEqual(o["params"]["temp"], 240.0, "no material given: PETG 240")
+        self.assertIn("heat nozzle to 240 C (PETG)", o["summary"])
         self.assertIn("nozzle off", o["summary"])
         self.assertEqual(self.gsent(), [], "nothing sent before the owner's yes")
 
@@ -303,15 +304,15 @@ class TestFilamentMoves(PrinterBase):
         o = self.run_cli("filament", "retract", "--mm", "10", "--speed", "10")
         r = self.run_cli("approve", o["request_id"], "--yes", "--by", "owner_chat", "--quote", "test the retract")
         self.assertEqual(r["status"], "ok", r)
-        self.assertEqual(self.gsent(), ["M104 S300", "M83", "G1 E-10 F600", "M82", "M104 S0"])
+        self.assertEqual(self.gsent(), ["M104 S240", "M83", "G1 E-10 F600", "M82", "M104 S0"])
         res = r["result"]
         self.assertTrue(res["completed"])
         self.assertEqual(res["nozzle_target_set_to"], 0)
-        self.assertGreaterEqual(max(t["nozzle"] for t in res["timeline"]), 297)
+        self.assertGreaterEqual(max(t["nozzle"] for t in res["timeline"]), 237)
         self.assertIn("reached_temp_after_s", res)
 
     def test_unload_chunks_and_hold(self):
-        o = self.run_cli("filament", "unload", "--speed", "10", "--hold")
+        o = self.run_cli("filament", "unload", "--speed", "10", "--hold", "--purge")
         self.assertEqual(o["params"]["chunks"], [5.0, -45.0, -35.0])
         self.run_cli("approve", o["request_id"], "--yes")
         g = self.gsent()
@@ -324,8 +325,8 @@ class TestFilamentMoves(PrinterBase):
         r = self.run_cli("approve", o["request_id"], "--yes", FILAMENT_HEAT_TIMEOUT_S="2")
         self.assertEqual(r["status"], "error", r)
         g = self.gsent()
-        self.assertEqual(g, ["M104 S300", "M104 S0"])
-        self.assertTrue(any("filament extrude stopped" in p.name for p in self.packets()))
+        self.assertEqual(g, ["M104 S240", "M104 S0", "M140 S0"], "failure path uses the urgent cooldown")
+        self.assertTrue(any("URGENT cooldown" in p.name for p in self.packets()))
 
     def test_refused_while_printing_and_cooldown(self):
         self.fp.status.update(state=1, deviceState=1)
@@ -336,4 +337,96 @@ class TestFilamentMoves(PrinterBase):
         c = self.run_cli("printer", "cooldown")
         self.assertEqual(c["status"], "awaiting_owner")
         self.assertEqual(self.run_cli("approve", c["request_id"], "--yes")["status"], "ok")
+        self.assertEqual(self.gsent(), ["M104 S0", "M140 S0"])
+
+
+class TestPreheat(Base):
+    """1.2.1: per-material preheat, explicit 300 C purge, shared 300 C nozzle ceiling (no printer needed)."""
+
+    def temp(self, *extra, **env):
+        o = self.run_cli("filament", "retract", "--mm", "5", *extra, **env)
+        return o["params"]["temp"] if o["status"] == "awaiting_owner" else o
+
+    def test_material_defaults(self):
+        for mat, t in (("PLA", 210), ("pla", 210), ("PETG", 240), ("ABS", 245), ("ASA", 250), ("TPU", 225)):
+            self.assertEqual(self.temp("--material", mat), t, mat)
+        self.assertEqual(self.temp(), 240)
+        self.assertEqual(self.temp(FILAMENT_MATERIAL="PLA"), 210)
+        self.assertEqual(self.temp(FILAMENT_PREHEAT_C="300"), 300, "owner's personal override via env")
+        self.assertEqual(self.temp("--material", "PLA", FILAMENT_PREHEAT_C="300"), 210, "--material wins")
+        bad = self.temp("--material", "NYLON")
+        self.assertEqual(bad["status"], "error")
+        self.assertIn("unknown material", bad["errors"][0])
+
+    def test_purge_and_ceiling(self):
+        self.assertEqual(self.temp("--purge"), 300)
+        self.assertEqual(self.temp("--temp", "300"), 300)
+        self.assertEqual(self.temp("--material", "PLA", "--purge"), 300, "--purge wins over the material")
+        for t in ("301", "320"):
+            self.assertEqual(self.temp("--temp", t)["status"], "error", t)
+        self.assertEqual(self.temp("--purge", FILAMENT_MAX_C="280")["status"], "error", "lower FILAMENT_MAX_C applies")
+        self.assertEqual(self.temp("--temp", "290", FILAMENT_MAX_C="350"), 290)
+        self.assertEqual(self.temp("--temp", "310", FILAMENT_MAX_C="350")["status"], "error", "cannot raise past 300")
+
+    def test_heat_shares_the_ceiling(self):
+        self.assertEqual(self.run_cli("printer", "heat", "--nozzle", "301")["status"], "error")
+        o = self.run_cli("printer", "heat", "--nozzle", "290")
+        self.assertEqual(o["status"], "awaiting_owner", o)
+        self.assertIn("purge territory", o["summary"])
+        self.assertTrue(o["warnings"])
+        o = self.run_cli("printer", "heat", "--nozzle", "240")
+        self.assertEqual(o["warnings"], [])
+
+
+class TestUrgentCooldown(PrinterBase):
+    """1.2.1: `printer cooldown --urgent --reason` skips the owner yes; nothing else can be urgent."""
+
+    def gsent(self):
+        return [m.get("params", {}).get("gcodeCmd") for m in self.fp.ws_messages if "gcodeCmd" in m.get("params", {})]
+
+    def test_urgent_runs_now_and_logs(self):
+        o = self.run_cli("printer", "cooldown", "--urgent", "--reason", "burning smell", "--fan")
+        self.assertEqual(o["status"], "ok", o)
+        self.assertEqual(self.gsent(), ["M104 S0", "M140 S0", "M106 S255"])
+        self.assertEqual(self.run_cli("pending")["pending"], [], "no approval request")
+        pk = [p for p in self.packets() if "URGENT cooldown" in p.name]
+        self.assertEqual(len(pk), 1)
+        ctx = json.loads(pk[0].read_text())["context"]
+        self.assertIn("burning smell", ctx["summary"])
+        self.assertTrue(ctx["output"]["at"].endswith("ET"))
+        log = json.loads((self.tmp / "state" / "safety_log.json").read_text())
+        self.assertEqual(log[-1]["reason"], "burning smell")
+
+    def test_urgent_needs_reason_and_works_with_kill_switch(self):
+        self.assertEqual(self.run_cli("printer", "cooldown", "--urgent")["status"], "error")
+        self.assertEqual(self.gsent(), [])
+        o = self.run_cli("printer", "cooldown", "--urgent", "--reason", "jam", PHYSICAL_ACTIONS_ENABLED="false")
+        self.assertEqual(o["status"], "ok", "removing heat is allowed even with the kill switch off")
+        self.assertEqual(self.gsent(), ["M104 S0", "M140 S0"])
+
+    def test_non_urgent_cooldown_still_gated(self):
+        o = self.run_cli("printer", "cooldown")
+        self.assertEqual(o["status"], "awaiting_owner")
+        self.assertEqual(self.gsent(), [])
+
+    def test_urgent_rejected_elsewhere(self):
+        for args in (["printer", "pause", "--urgent"], ["printer", "home", "--urgent"],
+                     ["printer", "heat", "--nozzle", "200", "--urgent"], ["filament", "retract", "--mm", "5", "--urgent"]):
+            o = self.run_cli(*args)
+            self.assertEqual(o["status"], "error", args)
+            self.assertIn("only applies to `printer cooldown`", " ".join(o["errors"]))
+        self.assertEqual(self.gsent(), [])
+        self.assertEqual(self.run_cli("pending")["pending"], [])
+
+    def test_watch_auto_cooldown_on_runaway(self):
+        self.fp.status.update(state=0, deviceState=0, nozzleTemp="25", targetNozzleTemp=0, bedTemp0="65", targetBedTemp0=0)
+        self.run_cli("watch", "--once", "--reset")
+        self.fp.status.update(bedTemp0="70")
+        w = self.run_cli("watch", "--once")
+        self.assertNotIn("urgent_cooldown", w["last"].get("action", {}), "off by default")
+        self.assertEqual(self.gsent(), [])
+        self.run_cli("watch", "--once", "--reset")
+        self.fp.status.update(bedTemp0="76")
+        w = self.run_cli("watch", "--once", AUTO_COOLDOWN_ON_ANOMALY="true")
+        self.assertTrue(w["last"]["action"]["urgent_cooldown"]["ok"], w["last"])
         self.assertEqual(self.gsent(), ["M104 S0", "M140 S0"])

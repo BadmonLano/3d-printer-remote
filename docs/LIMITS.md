@@ -53,3 +53,15 @@ run against the fake printer. Details: docs/PROTOCOL.md, "Observed on hardware".
 - Maintenance hours count only prints started through this tool.
 - Timelapse needs ffmpeg for mp4; without it a GIF is built (needs Pillow).
 - Telegram is optional and only used when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set.
+
+## Filament preheat and urgent cooldown
+- Filament preheat follows the material spec: PLA 210, PETG 240, ABS 245, ASA 250, TPU 225 C (middle of the usual
+  published ranges), PETG when no material is given. `FILAMENT_PREHEAT_C` in a local `.env` overrides it for one
+  owner. `--purge` (or `--temp 300`) heats to 300 C to melt hardened filament from the tip. 300 C is close to the stock
+  CR-10 SE hotend rating, so filament moves turn the nozzle off afterwards unless `--hold`.
+- One nozzle ceiling for everything: 300 C (`printer heat`, filament moves, purge). `FILAMENT_MAX_C` can lower it but
+  not raise it. The printer itself reports 320 C as its max; we stay 20 C under it. `printer heat` above 260 C (the top of
+  normal printing ranges) is allowed but warns that it's purge territory.
+- Urgent cooldown only turns heaters off. It can't undo a crash or clear a jam, and if the printer is unreachable it
+  can only tell you to switch the printer off at the power switch.
+- Urgent cooldown during a print ends that print (the heaters go off).

@@ -1,9 +1,9 @@
 # 3D Printer Remote
 
-> **Not yet hardware-verified on a CR-10 SE** for uploads and physical actions (start, pause, heat, move...). The
+> **Not yet hardware-verified on a CR-10 SE** for uploads and most physical actions (start, pause, heat, move...). The
 > slicer side was checked on a real Creality Print 7.2 install, and read-only live data (status, files, history,
-> config, mesh) was checked on a real CR-10 SE. Everything that changes the printer has only run against a fake
-> printer. See [docs/LIMITS.md](docs/LIMITS.md).
+> config, mesh) was checked on a real CR-10 SE, plus one owner-approved `filament retract`. See
+> [docs/LIMITS.md](docs/LIMITS.md).
 
 A bridge between your AI agent and **Creality Print 7.2** plus a **Creality CR-10 SE** (Creality OS, Klipper based,
 built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Python CLI and reads its JSON.
@@ -18,9 +18,10 @@ built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Py
   tracker with a jam log, a file library, a gcode inspector, and a health report.
 - **Camera (optional):** ET-timestamped snapshots, a bed-clear check, a first-layer photo, a done photo with a
   "clear the bed" reminder, timelapse build, and a malfunction watch with owner_inbox / Telegram alerts.
-- **Filament:** extrude, retract, load and unload. Each one preheats the nozzle to 300 C first (melts hardened filament in
-  the tip), moves the filament slowly, then turns the nozzle off (or `--hold`). Limits: 100 mm per extrude or retract,
-  120 mm per load or unload.
+- **Filament:** extrude, retract, load and unload. Each one preheats for the material (`--material PLA` 210, PETG 240
+  by default, ABS 245, ASA 250, TPU 225). `--purge` or `--temp 300` is the explicit 300 C hardened-filament purge.
+  Then it moves the filament slowly and turns the nozzle off (or `--hold`). The hard cap is 300 C (the printer reports
+  320 C; we stay under the stock hotend rating). Limits: 100 mm per extrude or retract, 120 mm per load or unload.
 - **Owner approval:** start, pause, resume, cancel, heat, home, move, fan, cooldown, filament moves and motion/heat gcode never run on the first
   call. They create a request (`awaiting_owner`) with a summary. **The owner answers YES or NO in chat.** On yes the
   agent runs `approve <id> --yes`, an automatic **preflight** checks the printer, and the action runs only if preflight
@@ -40,7 +41,7 @@ python bots\printer_remote.py printer upload "...\plate_1.gcode" --name egg_set.
 python bots\printer_remote.py printer start egg_set.gcode --color white --material PETG   # -> awaiting_owner
 #   agent shows the summary, owner says "yes"
 python bots\printer_remote.py approve r20261126_141500_ab12 --yes --by owner_chat --quote "yes"
-python bots\printer_remote.py filament retract --mm 10 --speed 2                         # -> awaiting_owner
+python bots\printer_remote.py filament retract --mm 10 --speed 2 --material PETG                        # -> awaiting_owner
 python bots\printer_remote.py watch --interval 120 --stop-when-idle
 ```
 
@@ -48,7 +49,7 @@ Linux / macOS (set the slicer paths when they aren't the Windows defaults):
 ```
 export CREALITY_PRINT_EXE="$HOME/Applications/CrealityPrint.AppImage"
 export CREALITY_DATA_DIR="$HOME/.config/Creality/Creality Print/7.0"
-export PRINTER_IP=192.168.1.50
+export PRINTER_IP=<PRINTER_IP>   # your printer's LAN address
 python3 bots/printer_remote.py detect
 python3 bots/printer_remote.py printer status
 ```
@@ -72,8 +73,8 @@ Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skill
 | `printer files/history/mesh/objects/timelapses/config/ota/materials` | read-only printer queries | no |
 | `printer upload` | store gcode on the printer (does not print) | no |
 | `printer gcode <line>` | M105/M114/M115/M119/M27/M31/M503/M20 free | anything else does |
-| `printer start/pause/resume/cancel/heat/home/move/fan/cooldown`, `printer light` | physical actions | **yes** (light: no) |
-| `filament extrude --mm N` / `retract --mm N` / `load` / `unload` | preheat to 300 C (default), wait within 3 C, move filament (M83, then M82), nozzle off | **yes** |
+| `printer start/pause/resume/cancel/heat/home/move/fan/cooldown`, `printer light` | physical actions | **yes** (light: no; `cooldown --urgent`: no) |
+| `filament extrude --mm N` / `retract --mm N` / `load` / `unload` | preheat for the material (`--material PLA`; PETG 240 default; `--purge` = 300 C), wait within 3 C, move filament (M83, then M82), nozzle off | **yes** |
 | `approve <id> --yes/--no`, `preflight <id>`, `pending` | owner answer, go/no-go checks, open requests | - |
 | `camera snapshot/set-reference/bed-check` | camera | no |
 | `watch [--once]` | malfunction watch, job events, alerts | pause asks the owner unless AUTO_PAUSE_ON_ANOMALY=true |
@@ -89,7 +90,11 @@ Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skill
    printer error, temps sane, the file is on the printer (start), filament on hand (when inventory is used), and the
    camera bed check (flags it; blocks only on a clearly bad score). The action runs only if nothing blocking fails;
    otherwise the status is `preflight_failed` and the failed checks are listed.
-4. Requests expire after `APPROVAL_TTL_MIN` (15 by default) and are single use. `PHYSICAL_ACTIONS_ENABLED=false`
+4. **Urgent cooldown** is the one exception: `printer cooldown --urgent --reason "..."` turns the heaters off right away
+   with no owner yes, for urgent cases only (jam, burning smell, runaway heat or printer error, crash on camera, owner
+   says stop, a hot nozzle left after a failure). It's logged to owner_inbox and the safety log. Nothing else can be
+   urgent.
+5. Requests expire after `APPROVAL_TTL_MIN` (15 by default) and are single use. `PHYSICAL_ACTIONS_ENABLED=false`
    blocks everything, including auto-pause.
 
 ## Output contract

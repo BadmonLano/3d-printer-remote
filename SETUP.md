@@ -40,6 +40,9 @@
 | APPROVAL_TTL_MIN | optional | minutes an approval request stays open (15) |
 | PHYSICAL_ACTIONS_ENABLED | optional | `false` blocks every physical action, auto-pause included |
 | AUTO_PAUSE_ON_ANOMALY | optional | `false` by default; `true` lets watch pause without asking |
+| AUTO_COOLDOWN_ON_ANOMALY | optional | `false` by default; `true` lets watch turn the heaters off on runaway heat or errors |
+| FILAMENT_MATERIAL | optional | default material for filament moves (PETG) |
+| FILAMENT_PREHEAT_C | optional | personal preheat override when no `--material` is given (cap 300) |
 | BED_X_MM / BED_Y_MM / MAX_Z_MM | optional | move limits (220 / 220 / 250) |
 | FILAMENT_COST_PER_KG, FILAMENT_LOW_G | optional | cost math and low-spool warning |
 | LIBRARY_ROOTS | optional | folders for `library scan` (separated by `;`) |

@@ -2,6 +2,9 @@
 
 Version history, newest first. Details: [CHANGELOG.md](CHANGELOG.md).
 
+## v1.2.1: urgent cooldown
+- Heaters-off without asking, for urgent cases only; real printer address out of tracked files.
+
 ## v1.2.0: filament control
 - Owner-approved extrude, retract, load and unload with a 300 C preheat, plus cooldown.
 

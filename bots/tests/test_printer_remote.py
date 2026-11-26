@@ -51,7 +51,7 @@ def make_data_dir(root: Path) -> Path:
     write_json(dd / "user" / "default" / "process" / "Big gap.json",
                {"name": "Big gap", "from": "User", "inherits": "0.20mm Standard @Creality CR-10 SE 0.4 nozzle",
                 "print_settings_id": "Big gap", "enable_support": "1"})
-    write_json(dd / "deviceInfo.json", {"groups": [{"list": [{"address": "10.9.9.9", "model": "F003"}]}]})
+    write_json(dd / "deviceInfo.json", {"groups": [{"list": [{"address": "192.0.2.10", "model": "F003"}]}]})
     return dd
 
 
@@ -119,11 +119,12 @@ class Base(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="pr_test_"))
         self.dd = make_data_dir(self.tmp)
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("PRINTER_", "CAMERA_", "TELEGRAM_", "PR_", "CREALITY_", "AUTO_PAUSE", "WATCH_"))}
+                    if not k.startswith(("PRINTER_", "CAMERA_", "TELEGRAM_", "PR_", "CREALITY_", "AUTO_", "WATCH_",
+                                         "FILAMENT_", "PHYSICAL_", "APPROVAL_", "BED", "MAX_Z"))}
         self.env.update({"CREALITY_DATA_DIR": str(self.dd), "CREALITY_PRINT_EXE": str(HERE / "fake_slicer.py"),
                          "PR_STATE_DIR": str(self.tmp / "state"), "PR_OWNER_INBOX": str(self.tmp / "owner_inbox"),
                          "PR_OUTPUT_DIR": str(self.tmp / "gcode"), "APPDATA": str(self.tmp),
-                         "PR_FAKE_GUI_RUNNING": "none"})
+                         "PR_FAKE_GUI_RUNNING": "none", "PR_NO_DOTENV": "1"})
         self.tg = TelegramMock()
         self.env.update({"TELEGRAM_BOT_TOKEN": "TEST", "TELEGRAM_CHAT_ID": "1",
                          "TELEGRAM_API_BASE": f"http://127.0.0.1:{self.tg.port}"})
@@ -151,7 +152,7 @@ class TestCore(Base):
         o = self.run_cli("detect")
         for k in ("status", "job_id", "errors", "exe", "data_dir", "gui_running", "printer_ip"):
             self.assertIn(k, o)
-        self.assertEqual(o["printer_ip"], "10.9.9.9")
+        self.assertEqual(o["printer_ip"], "192.0.2.10")
         self.assertFalse(o["gui_running"])
 
     def test_presets_list_show_resolved(self):
@@ -248,7 +249,7 @@ class TestPrinterAndGate(Base):
                               modelVersion="printer hw ver:;printer sw ver:;DWIN hw ver:F003;DWIN sw ver:V1.1.0.28;",
                               lightSw=1, tfCard=1, materialDetect=0, materialStatus=0, usedMaterialLength=0,
                               realTimeSpeed="0.000000", realTimeFlow="0.000000", repoPlrStatus=0, printId="",
-                              video=0, video1=0, hostname="Right")
+                              video=0, video1=0, hostname="printer")
         p = self.run_cli("printer", "status")["printer"]
         self.assertEqual((p["state"], p["idle"], p["printing"]), ("cancelled", True, False))
         self.assertEqual(p["nozzle"], {"actual": 23.65, "target": 0.0, "max": 320.0})

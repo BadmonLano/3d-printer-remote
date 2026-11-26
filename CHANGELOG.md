@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.1
+- `printer cooldown --urgent --reason "..." [--fan]`: heaters off right away (nozzle 0, bed 0, optional part fan max),
+  with no owner yes. It's for urgent cases only (jam, burning smell, runaway or printer error, crash on camera, the owner
+  says stop, a hot nozzle left after a failure). It writes an owner_inbox packet, a `safety_log` entry and a note on the
+  open history job, all with ET time. Plain `printer cooldown` still needs the owner's yes. `--urgent` is refused on
+  every other command.
+- Urgent cooldown ignores `PHYSICAL_ACTIONS_ENABLED=false` on purpose: it only removes heat, and the kill switch blocks
+  actions that add risk.
+- Filament-move failures (heat timeout, printer error, lost connection) now use the same urgent cooldown. The new
+  `AUTO_COOLDOWN_ON_ANOMALY` (default false) lets the watch call it on thermal anomalies or printer errors.
+- Docs: the real printer LAN address is out of tracked files (placeholder `<PRINTER_IP>`; test fixtures use
+  192.0.2.10 from the documentation range).
+- Preheat follows the material spec (owner OK, 1:41-1:42 PM ET): `--material` or `FILAMENT_MATERIAL` gives PLA 210,
+  PETG 240, ABS 245, ASA 250, TPU 225 C, and PETG 240 when nothing is given. `--purge` (or `--temp 300`) is the explicit
+  300 C hardened-filament purge. `FILAMENT_PREHEAT_C` stays as a personal override for a local `.env`.
+- One nozzle ceiling: 300 C for filament moves and `printer heat` (heat was 0-260). `FILAMENT_MAX_C` can lower it but
+  not raise it, and anything above is rejected. `printer heat` above 260 C warns that it's purge territory.
+- Tests ignore the local `.env` (`PR_NO_DOTENV=1`), so the owner's personal settings can't change test results.
+
 ## 1.2.0
 
 > Not yet hardware-verified on a CR-10 SE beyond read-only data and one owner-approved retract (see docs/PROTOCOL.md).

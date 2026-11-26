@@ -9,3 +9,4 @@ Otherwise run `python bots/printer_remote.py watch --once` and read `last`:
   path. If `action.pause_requested` is true, ask "Pause it? yes or no". Run
   `approve <action.request_id> --yes --by owner_chat --quote "<their words>"` only after the owner says yes.
 - `warnings` that the printer or camera was unreachable 3 times in a row: tell the owner once.
+- If `action.urgent_cooldown` is present, tell the owner right away that the heaters were turned off and why.
