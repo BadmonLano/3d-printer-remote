@@ -1,17 +1,17 @@
 ---
-version: 1.2.2
+version: 2.0.0
 name: printer-remote
-description: Drive Creality Print 7.2 and a Creality CR-10 SE from the `3D Printer Remote` CLI (not yet hardware-verified on a CR-10 SE). Detect the slicer, list/clone/edit presets, slice 3MF/STL, check bed fit, read LIVE printer data, upload over LAN, run a print queue with filament swaps, track history/cost/filament/maintenance, inspect gcode, take camera snapshots, check the bed and watch prints. Use when the owner says slice this, print this, what's the printer doing, printer status, temps, progress, is the bed clear, watch the print, queue these, how much filament is left, pause/cancel the print, heat the bed, move the head, change print settings, will this fit the bed, or a packet named "printer_remote - ..." lands in owner_inbox/.
+description: Drive Creality Print 7.2 and Creality OS printers (CR-10 SE first) from the `3D Printer Remote` CLI, from one printer up to a small farm (fleet, shared queue, opt-in autonomy, dashboard). Detect the slicer, list/clone/edit presets, slice 3MF/STL, check bed fit, read LIVE printer data, upload over LAN, run a print queue with filament swaps, track history/cost/filament/maintenance, inspect gcode, take camera snapshots, check the bed and watch prints. Use when the owner says slice this, print this, what's the printer doing, printer status, temps, progress, is the bed clear, watch the print, queue these, how much filament is left, pause/cancel the print, heat the bed, move the head, change print settings, will this fit the bed, fleet status, which printer is free, print 4 copies, run the farm queue, kill switch, stop everything, dashboard, or a packet named "printer_remote - ..." lands in owner_inbox/.
 ---
 
 **Prime Directive Derivative:** The printer and the people around it stay safe: the agent slices, reads and watches freely, but nothing heats, moves, starts, pauses or cancels until the owner says yes in chat and the automatic preflight passes.
 
 # printer-remote
 
-> Not yet hardware-verified on a CR-10 SE. If `printer status` fails or fields come back null, say so plainly.
+> Hardware-verified on one CR-10 SE: live data, filament retract/unload/extrude, start, and mid-print pause, resume, fan, heat and light. Upload, cancel, home, move, load and cooldown are not yet; farm features are fake-tested only. If `printer status` fails or fields come back null, say so plainly.
 
 Run from the project root: `python bots/printer_remote.py <command>` (`python3` on Linux/macOS).
-Every command prints JSON. Read `status` (`ok`, `error`, `skipped`, `awaiting_owner`, `declined`, `preflight_failed`, `alert`), `job_id`, `errors` and `warnings`.
+Every command prints JSON. Read `status` (`ok`, `error`, `skipped`, `awaiting_owner`, `declined`, `preflight_failed`, `alert`, `notified`), `job_id`, `errors` and `warnings`.
 
 ## Free commands (run without asking)
 - `detect`: exe, version, preset folders, GUI open?, printer IP, camera configured.
@@ -35,6 +35,16 @@ Every command prints JSON. Read `status` (`ok`, `error`, `skipped`, `awaiting_ow
 3. On yes, preflight runs automatically. `ok` means it ran. `preflight_failed` means nothing was sent: tell the owner which checks failed (`preflight.failed`) and what to fix. Mention any `flagged` checks.
 - `preflight <request_id>` runs the checks without executing. `pending` lists open requests, which expire after 15 minutes.
 
+## Farm mode (2.0; only if the owner set up `printers.json`)
+- Target one printer with `--printer <name>` (`python bots/printer_remote.py --printer se1 printer status`). Without it, the default printer is used, as in 1.x.
+- Free: `fleet list`, `fleet status` (who is printing, who is free and why not), `fleet stream --seconds 60`, `fleet discover --subnet <owner's subnet>` (read-only), `farm list`, `farm plan` (dry run), `farm sync`, `ops maint`, `ops spool list`, `ops analytics`, `audit`, `policy show`, `policy check --action start --printer X`, `alerts list`, `selftest hardware` (list only), `serve --status`, `detector list`, `playbook list`.
+- Queue: `farm add <file> --material PETG --color white [--copies N --priority P --depends <job> --batch <name> --profile <trusted-profile>]`, `farm intake orders.csv`. Adding a job is not a physical action.
+- `farm dispatch` uploads and makes one normal start request per printer. Treat each like `printer start`: show the summary, say which printer, and ask the owner. If a policy made it `auto_after_preflight`, the result says so (`by: policy:auto_after_preflight`); tell the owner it started. `notified` means policy is `notify_only`: nothing was sent.
+- After a spool swap: `fleet set <name> --material PLA --color black` (or `ops spool --move <spool id> --to <printer>`), otherwise routing sends the wrong jobs.
+- Kill switch: `policy kill [--printer X] --reason "..."` whenever the owner says stop everything, or something looks unsafe with nobody watching. Only the owner lifts it (`policy unkill`). Urgent cooldown still works while killed.
+- `serve` runs the poller, farm sync and the dashboard at http://127.0.0.1:8787. Start or stop it only when the owner asks. Never bind it to another address, create tokens or change `policy.json` unless the owner asks for exactly that.
+- `selftest hardware --run <step>` makes a normal gated request for one unverified action; ask the owner first and say what will physically happen (home and move move the head; cancel ends the print).
+
 ## Urgent cooldown (the only action without the owner's yes)
 `printer cooldown --urgent --reason "<what you saw>" [--fan]` sets nozzle and bed to 0 right away, then logs an owner_inbox packet and a safety-log entry with the ET time. Tell the owner right after, with the reason.
 Use it only when waiting could hurt something:
@@ -52,7 +62,8 @@ Filament moves that fail (heat timeout, error, lost connection) already call the
 - One request, one answer. If the summary changes (different file, temps, color), make a new request.
 - The bed check and watch are heuristics. Never say the bed is definitely clear or the print is definitely fine.
 - On a watch alert, tell the owner what it saw, the snapshot path and the ET time. If it opened a pause request, ask "Pause it? yes or no". Don't turn on AUTO_PAUSE_ON_ANOMALY yourself.
-- Don't edit `.env`, the approval or preflight code, or `PHYSICAL_ACTIONS_ENABLED`.
+- Don't edit `.env`, `policy.json`, the approval or preflight code, or `PHYSICAL_ACTIONS_ENABLED`. Never turn on an autonomy level, auto-dispatch or a LAN bind yourself.
+- A pause on the CR-10 SE parks the head, lifts Z ~46 mm and drops the nozzle to 140 C; resume reheats for about 75 s first. Tell the owner a pause costs ~3 minutes.
 - If live data is stale or `printer status` errors, say so; don't guess temps or progress.
 - Use `--purge` (300 C) only when the owner asks for it or the default temperature can't clear a clog.
 - Kids' items, food contact and small parts are the owner's safety call; point out the risk and let them decide.

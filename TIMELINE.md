@@ -2,6 +2,12 @@
 
 Version history, newest first. Details: [CHANGELOG.md](CHANGELOG.md).
 
+## v2.0.0: farm control plane
+- Fleet, shared farm queue with routing and failover, opt-in autonomy policies with kill switch and audit, `serve`
+  daemon with dashboard and REST API, tokens and roles, webhook alerts, maintenance/spools/analytics, pluggable
+  slicers/detectors/playbooks, Moonraker stub, chaos suite and `selftest hardware`. Pause, resume, fan, heat and light
+  verified mid-print on the real CR-10 SE; farm features fake-tested only.
+
 ## v1.2.2: slice origin fix and real-print notes
 - Creality Print 7.2 settings-file origin fix, print-quality skill checklist, unittest docs,
   and hardware notes for retract, unload, extrude and an owner-approved start.

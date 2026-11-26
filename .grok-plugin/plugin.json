@@ -1,7 +1,7 @@
 {
   "name": "3d-printer-remote",
-  "version": "1.2.2",
-  "description": "Agent bridge for Creality Print 7.2 and a Creality CR-10 SE. Not yet hardware-verified on a CR-10 SE (printer protocol from K1-family firmware; tests use a fake printer). Your AI agent detects the slicer, edits copies of presets, slices 3MF/STL from the command line, checks bed fit, reads live printer data, runs a print queue with filament swaps, tracks history, cost, filament and maintenance, and watches prints with a camera. Physical actions (start, pause, resume, cancel, heat, home, move, fan, cooldown, filament extrude/retract/load/unload) run only after the owner says yes in chat and an automatic preflight check passes. The one exception is an urgent cooldown (heaters off) for jams, runaway heat or crashes.",
+  "version": "2.0.0",
+  "description": "Agent bridge and small-farm control plane for Creality Print 7.2 and Creality OS printers (CR-10 SE first). Your AI agent detects the slicer, edits copies of presets, slices 3MF/STL, checks bed fit, reads live printer data, runs a print queue with filament swaps, tracks history, cost, filament and maintenance, and watches prints with a camera. 2.0 adds an opt-in farm layer: a fleet of printers, a shared queue routed by material, color, nozzle, bed fit and priority with copies, dependencies and failover, autonomy policies with a kill switch, rate limits and an audit log, a local dashboard and REST API with hashed tokens and roles, webhook alerts, and a reconnecting stream. Physical actions run only after the owner says yes in chat and an automatic preflight passes, unless the owner opts a trusted profile into auto-after-preflight. The one exception is an urgent cooldown (heaters off). Hardware-verified on one CR-10 SE for live data, filament moves, start, pause, resume, fan, heat and light; farm features are tested against fake printers.",
   "author": {
     "name": "Bentayga Empire LLC",
     "url": "https://github.com/BadmonLano"
@@ -16,7 +16,10 @@
     "slicer cli",
     "klipper",
     "camera",
-    "owner approval"
+    "owner approval",
+    "print farm",
+    "fleet",
+    "dashboard"
   ],
   "logo": "assets/logo.png",
   "skills": [

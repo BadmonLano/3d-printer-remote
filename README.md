@@ -2,14 +2,17 @@
 
 # 3D Printer Remote
 
-> **Not yet hardware-verified on a CR-10 SE** for uploads and most physical actions (start, pause, heat, move...). The
-> slicer side was checked on a real Creality Print 7.2 install, and read-only live data (status, files, history,
-> config, mesh) was checked on a real CR-10 SE. Owner-approved real runs on a CR-10 SE have also been done:
-> `filament retract` 10 mm, `filament unload` 80 mm and `filament extrude` 30 mm, all with the 300 C purge, no errors.
+> **Hardware status (honest):** on one real CR-10 SE (Creality OS, DWIN V1.1.0.28) these ran for real with the
+> owner's OK: live data, `filament retract/unload/extrude`, `printer start`, and (2.0.0, during a running print)
+> `printer pause`, `resume`, `fan`, `heat` (small mid-print change) and `light`. Not yet tried on hardware: upload,
+> cancel, home, move, load, idle cooldown. Everything new in 2.0 (fleet, farm queue, autonomy policies, service,
+> dashboard, tokens, alerts, Moonraker) is tested against fake printers only. `selftest hardware` walks the rest.
 > See [docs/LIMITS.md](docs/LIMITS.md).
 
-A bridge between your AI agent and **Creality Print 7.2** plus a **Creality CR-10 SE** (Creality OS, Klipper based,
-built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Python CLI and reads its JSON.
+A bridge between your AI agent and **Creality Print 7.2** plus **Creality OS printers** (CR-10 SE first; K1 family by
+protocol), and since 2.0 a small **farm control plane**: many printers, one shared queue, opt-in autonomy, a service
+with a dashboard and REST API. Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Python CLI and reads its
+JSON. With no farm config it behaves exactly like 1.x: one printer, the owner's yes plus preflight for every action.
 
 - **Slicer:** detect Creality Print; list, show, clone and edit presets (only copies, or user presets backed up
   first); slice 3MF/STL from the command line with overrides; read time, grams and cost from the gcode; open a file in
@@ -30,7 +33,18 @@ built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Py
   agent runs `approve <id> --yes`, an automatic **preflight** checks the printer, and the action runs only if preflight
   passes.
 
-The core is the Python 3.12 standard library. Pillow and numpy are optional (camera features).
+- **Farm (2.0, opt-in):** `printers.json` fleet with `--printer <name>` on every printer command, `fleet status` /
+  `fleet stream` / read-only LAN `fleet discover`; a shared `farm` queue routed by material, color, nozzle, bed fit,
+  availability and priority, with dependencies, N copies across the farm, batch affinity and failover; autonomy
+  policies (`owner_yes` default, `auto_after_preflight` for trusted profiles, `notify_only`), a global and per-printer
+  kill switch, rate limits and a full audit log; `serve` (supervised daemon, pid file, health endpoint, local
+  dashboard, JSON REST API, hashed API tokens with owner / operator / viewer roles); webhook + Telegram alerts;
+  per-printer machine-hour maintenance, spool locations, analytics, CSV/JSON order intake; pluggable slicers,
+  failure detectors (ML hook) and recovery playbooks; a Moonraker backend stub; a reconnecting stream and a chaos
+  test suite.
+
+The core is the Python 3.12 standard library. Pillow and numpy are optional (camera features); PyYAML is optional
+(`printers.yaml`).
 
 ## Quick start
 
@@ -57,6 +71,18 @@ python3 bots/printer_remote.py detect
 python3 bots/printer_remote.py printer status
 ```
 
+Farm quick start (all optional; see [SETUP.md](SETUP.md#farm-mode-20-optional)):
+```
+python bots/printer_remote.py fleet discover --subnet 192.0.2.0/24          # read-only scan for port 9999
+python bots/printer_remote.py fleet add se1 --material PETG --color white --ip-env PRINTER_IP_SE1
+python bots/printer_remote.py fleet status
+python bots/printer_remote.py farm add egg.gcode --material PETG --color white --copies 4
+python bots/printer_remote.py farm plan                                       # dry run: who prints what
+python bots/printer_remote.py farm dispatch                                   # uploads, then asks the owner per start
+python bots/printer_remote.py serve                                           # http://127.0.0.1:8787 dashboard + API
+python bots/printer_remote.py selftest hardware                               # what's still unproven on hardware
+```
+
 Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skills/printer-remote/SKILL.md).
 
 ## Commands
@@ -81,6 +107,17 @@ Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skill
 | `approve <id> --yes/--no`, `preflight <id>`, `pending` | owner answer, go/no-go checks, open requests | - |
 | `camera snapshot/set-reference/bed-check` | camera | no |
 | `watch [--once]` | malfunction watch, job events, alerts | pause asks the owner unless AUTO_PAUSE_ON_ANOMALY=true |
+| `--printer <name>` (global, or on `printer`/`camera`/`watch` subcommands) | target one fleet printer from `printers.json` | - |
+| `fleet list/status/stream/discover/add/set/remove` | multi-printer status, live stream, read-only LAN discovery, config | no |
+| `farm add/list/plan/dispatch/sync/done/fail/cancel/release/priority/intake` | shared queue + routing; `dispatch` asks per start (policy) | start does (unless policy says auto) |
+| `policy show/check/set/kill/unkill`, `audit` | autonomy levels, kill switch, rate limits, audit log | set/unkill: owner role |
+| `token create/list/revoke` | API tokens (hashed) with roles owner / operator / viewer | owner role |
+| `alerts test/list` | webhook + Telegram alerts | no |
+| `serve [--host --port --interval --watch --auto-dispatch] / --status / --stop` | daemon + dashboard + REST API | API approvals need an owner token |
+| `ops maint/spool/analytics` | machine-hour maintenance per printer, spool locations, analytics | no |
+| `slicer list/slice --backend creality|orca|prusa` | pluggable slicers (orca/prusa are stubs) | no |
+| `detector list/run`, `playbook list/run` | failure detectors (imagediff + ML hook), recovery playbooks | playbook pause/cancel ask per policy |
+| `selftest hardware [--run step / --record step]` | walk the unverified actions one gated step at a time | gated steps do (never auto) |
 
 ## Approval and preflight
 
@@ -97,13 +134,18 @@ Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skill
    with no owner yes, for urgent cases only (jam, burning smell, runaway heat or printer error, crash on camera, owner
    says stop, a hot nozzle left after a failure). It's logged to owner_inbox and the safety log. Nothing else can be
    urgent.
-5. Requests expire after `APPROVAL_TTL_MIN` (15 by default) and are single use. `PHYSICAL_ACTIONS_ENABLED=false`
-   blocks everything, including auto-pause.
+5. Requests expire after `APPROVAL_TTL_MIN` (15 by default) and are single use; asking twice for the same thing
+   returns the open request (idempotent). `PHYSICAL_ACTIONS_ENABLED=false` and the kill switch (`policy kill`) block
+   everything, including auto-pause; urgent cooldown still works.
+6. **Autonomy is opt-in (2.0).** Without a `policy.json` nothing changes. With one, a printer, group or trusted
+   profile can be `auto_after_preflight` (only for start / pause / resume / cooldown, and only those listed in
+   `auto_actions`; rate limited; audited) or `notify_only` (never sends; writes a notice). Heat, move, home, fan,
+   gcode, filament moves, cancel and hardware self-test steps always need the owner.
 
 ## Output contract
 
 Every command prints one JSON object: `status` (`ok`, `error`, `skipped`, `awaiting_owner`, `declined`,
-`preflight_failed`, `alert`), `job_id`, `command`, `errors`, `warnings`, `started_at` / `finished_at` (ET) plus its
+`preflight_failed`, `alert`, `notified`), `job_id`, `command`, `errors`, `warnings`, `started_at` / `finished_at` (ET) plus its
 data. `printer stream --jsonl` prints one JSON line per update, then a `summary` line. Exit code 1 on `error`.
 
 Owner packets: `owner_inbox/printer_remote - <subject>_<YYYYMMDD_HHMMSS>.json`, written as `.tmp` then renamed, with
@@ -115,13 +157,15 @@ Owner packets: `owner_inbox/printer_remote - <subject>_<YYYYMMDD_HHMMSS>.json`, 
 python -m unittest discover -s bots/tests -v
 ```
 
-Standard library only, offline (fake slicer, printer, camera and Telegram), no hardware needed. Optional: `pip install -r requirements-dev.txt` adds pytest, and then `python -m pytest bots/tests` works too.
+Standard library only, offline (fake slicer, multiple fake printers with chaos controls, fake camera, Telegram,
+webhook, Moonraker and ML servers), no hardware needed. 139 tests. Optional: `pip install -r requirements-dev.txt` adds pytest, and then `python -m pytest bots/tests` works too.
 
 ## Honest limits
 
-See [docs/LIMITS.md](docs/LIMITS.md). In short: some physical actions are verified on a real CR-10 SE (filament
-moves and an owner-approved start) and others are not; the camera checks are simple image diffs that lighting can
-fool; the Creality Print CLI crashes on some 7.x builds (issue #574).
+See [docs/LIMITS.md](docs/LIMITS.md). In short: some physical actions are verified on one real CR-10 SE and others are
+not; every farm feature is fake-tested only and no multi-printer farm has run it yet; the camera checks are simple
+image diffs that lighting can fool; the Creality Print CLI crashes on some 7.x builds (issue #574). For a revenue farm
+today, a mature platform is lower risk; this project's value is the agent + owner-approval design.
 
 ## Credits
 

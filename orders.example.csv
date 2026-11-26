@@ -1,0 +1,2 @@
+order_id,file,material,color,copies,priority,nozzle,due
+A-1001,models/egg.gcode,PETG,white,4,5,0.4,2026-12-01

@@ -39,3 +39,47 @@ Include what you found, how to reproduce it, and what an attacker could do with 
 - Stock Creality OS has **no authentication** on ports 80 and 9999, so anyone on your Wi-Fi can talk to the printer.
   Keep it on a trusted network and never port-forward it.
 - `owner_inbox/` and `bots/state/` hold snapshots of your room and job history; keep them private.
+
+## Farm mode (2.0)
+
+### Autonomy
+- Default is unchanged: every physical action waits for the owner's yes. Autonomy only exists if you create a
+  `policy.json`. `auto_after_preflight` can only cover start, pause, resume and cooldown, and only the actions listed in
+  `auto_actions` in policy.json (default: start only). Heat, home, move, fan, gcode, filament moves, cancel and `selftest hardware` steps
+  always need the owner. A job profile overrides the printer's level, a printer overrides its groups (the safest group wins), a profile only
+  applies when its `materials`/`printers` limits match, and a printer or group set to `notify_only` can't be loosened by
+  a profile.
+- Auto runs still pass the full preflight, are rate limited (`rate_limits` in policy.json, default 6/hour farm-wide
+  and 3/hour per printer) and are written to the audit log with `by: policy:auto_after_preflight`.
+- **Risk:** an auto start with nobody in the room relies on preflight and the camera bed check. Without a camera,
+  nothing can tell that the last part is still on the bed. Use auto-start only with a camera on every printer, or only
+  for printers someone clears every time.
+- Kill switch: `policy kill [--printer X] --reason ...` blocks every physical action and auto-dispatch at once (CLI,
+  API `POST /api/kill`, dashboard button). Lifting it (`policy unkill`) needs the owner role. Urgent cooldown still
+  works while killed.
+
+### Service, tokens and roles
+- `serve` binds to `127.0.0.1` by default. Local requests with no token get the `SERVE_LOCAL_TRUST` role (default
+  `viewer`: read only). Binding to another address refuses to start unless at least one owner or operator token exists,
+  and every non-local request then needs a token.
+- Tokens: `token create --role owner|operator|viewer --name ...` prints the token once; only a PBKDF2 hash is stored in
+  `bots/state/tokens.json`. Revoke with `token revoke`. Send as `Authorization: Bearer <token>` or `X-API-Token`.
+- Roles: **viewer** reads status, queue, history, analytics and camera; **operator** adds farm jobs, dispatches (which
+  still asks the owner unless policy says otherwise), kills, and makes gated requests; **owner** also answers approvals
+  through the API, lifts the kill switch, changes policy and manages tokens. Approving through the API records the
+  token's name as the source; it's still the owner's yes and must be the owner's own.
+- Every API call that changes something and every CLI action is in `bots/state/audit.jsonl` with the actor.
+- There is no TLS. Don't expose `serve` to the internet. For access away from home, use a VPN (WireGuard, Tailscale)
+  to the PC, or a reverse proxy with TLS and the tokens above.
+
+### Network isolation (recommended for a farm)
+- Put printers on their own VLAN or SSID (an IoT network) with no internet access unless you need firmware updates.
+- Allow only the PC running `serve` to reach printer ports 80 and 9999 (firewall rule on the router or the VLAN).
+- Never port-forward 80, 9999 or 7125. Treat anyone on the printer network as able to start, heat or cancel prints.
+- `fleet discover` only connects to port 9999 and reads status; it never changes a printer. Keep scans to your own
+  subnet.
+
+### Webhooks and alerts
+- `ALERT_WEBHOOK_URLS` are secrets (they let anyone post to your channel). Keep them in `.env`. Set
+  `ALERT_WEBHOOK_SECRET` to have each JSON alert signed (`X-PR-Signature: sha256=<hmac>`) so a receiver can check it.
+- Alerts never contain printer IPs or tokens.

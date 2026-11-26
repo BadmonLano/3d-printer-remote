@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""3D Printer Remote: AI-agent bridge for Creality Print 7.2 and a Creality CR-10 SE.
-NOT YET HARDWARE-VERIFIED ON A CR-10 SE (printer protocol from K1-family firmware; see docs/LIMITS.md).
+"""3D Printer Remote: AI-agent bridge and farm control plane for Creality Print 7.2 and Creality OS printers.
+Hardware-verified on one CR-10 SE for the actions listed in docs/LIMITS.md; everything else (fleet, farm queue,
+service, Moonraker) is tested against fake printers only. `selftest hardware` walks the unverified actions.
 
 One consolidated CLI. Every subcommand prints ONE JSON object on stdout:
     {"status": "ok|error|awaiting_owner|declined|preflight_failed|skipped|alert", "job_id": "...", "command": "...",
@@ -12,12 +13,14 @@ Free (no confirm): detect, presets, slice, open, split-check, gcode inspect, que
 Gated (owner yes in chat): printer start / pause / resume / cancel / heat / home / move / fan / cooldown,
     filament extrude / retract / load / unload (preheat follows the material; PETG 240 default; --purge = 300 C),
     non-read-only gcode.
+    Opt-in autonomy (policy.json): `auto_after_preflight` for trusted profiles, `notify_only`; default stays owner yes.
     Exception: `printer cooldown --urgent --reason ...` (heaters off now, no owner yes) for urgent cases only.
     First call -> request + summary, status "awaiting_owner". The owner answers YES/NO in chat.
     `approve <request_id> --yes|--no` records it; on yes an automatic preflight runs and the action executes
     only if preflight passes. Agents pass along only the owner's own answer, never their own.
 
-Stdlib only (Pillow/numpy optional for camera features).
+Farm modules (bots/pr_*.py) plug into this one CLI: fleet, farm, policy, audit, token, alerts, serve, ops, slicer,
+detect, playbook, selftest. Stdlib only (Pillow/numpy optional for camera features, PyYAML optional for printers.yaml).
 Ideas credited in docs/CREDITS.md (marcmayol/claude-code-creality-print-plugin, sairaph/creality-slicer-mcp; both MIT).
 """
 from __future__ import annotations
@@ -38,6 +41,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -46,7 +50,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "2.0.0"
 BOT = "printer_remote"
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -71,6 +75,35 @@ OVERRIDE_ALIASES = {
 # ============================================================ env / paths / time
 class Fail(RuntimeError):
     """Expected failure -> JSON error, exit 1."""
+
+
+_CTX = threading.local()
+
+
+def active_printer() -> str | None:
+    """Fleet printer the current command/thread targets (None = the single classic printer from PRINTER_IP)."""
+    return getattr(_CTX, "printer", None)
+
+
+def set_active_printer(name: str | None) -> None:
+    _CTX.printer = name or None
+
+
+def current_actor() -> dict:
+    return getattr(_CTX, "actor", None) or {"name": env("PR_ACTOR") or "cli", "role": env("PR_ACTOR_ROLE") or "owner"}
+
+
+def set_actor(name: str | None, role: str | None = None) -> None:
+    _CTX.actor = {"name": name, "role": role or "owner"} if name else None
+
+
+def _mod(name: str):
+    """Lazy import of a farm module (bots/pr_*.py). They import this module back, so keep it lazy."""
+    import importlib
+    sys.modules.setdefault("printer_remote", sys.modules[__name__])
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    return importlib.import_module(name)
 
 
 def load_env() -> None:
@@ -838,6 +871,13 @@ def cmd_open(a, out):
 class WS:
     def __init__(self, host: str, port: int, path: str = "/", timeout: float = 5.0):
         self.sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            self._handshake(host, port, path)
+        except BaseException:
+            self.sock.close()  # never leak a half-open socket on a failed handshake
+            raise
+
+    def _handshake(self, host: str, port: int, path: str) -> None:
         key = base64.b64encode(os.urandom(16)).decode()
         req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: wsslicer\r\n\r\n")
@@ -928,6 +968,14 @@ def discover_printer_ip() -> str | None:
 
 
 def printer_cfg() -> dict:
+    name = active_printer()
+    if name:
+        return _mod("pr_fleet").cfg_for_name(name)
+    fl = _mod("pr_fleet")
+    if fl.fleet_configured() and not env("PRINTER_IP"):
+        only = fl.default_printer_name()
+        if only:
+            return fl.cfg_for_name(only)
     ip = discover_printer_ip()
     if not ip:
         raise Fail("printer IP unknown: set PRINTER_IP in .env (or add the printer to Creality Print's LAN list)")
@@ -935,9 +983,32 @@ def printer_cfg() -> dict:
             "gcode_root": env("PRINTER_GCODE_ROOT") or "/usr/data/printer_data/gcodes"}
 
 
+def backoff_delays(attempts: int, base: float, cap: float = 8.0) -> list[float]:
+    """Exponential backoff with small jitter: base, 2*base, 4*base ... capped."""
+    return [min(cap, base * (2 ** i)) * (0.85 + 0.3 * (secrets.randbelow(1000) / 1000)) for i in range(max(0, attempts))]
+
+
+def ws_connect(cfg: dict, retries: int | None = None) -> "WS":
+    """Open the printer websocket, retrying refused/timed-out connects with backoff. Safe for every caller because a
+    failed connect means nothing reached the printer."""
+    retries = int(env_float("PR_WS_CONNECT_RETRIES", 2)) if retries is None else retries
+    timeout = env_float("PR_WS_CONNECT_TIMEOUT_S", 5)
+    last = None
+    for delay in [0.0] + backoff_delays(retries, env_float("PR_WS_BACKOFF_S", 0.5)):
+        if delay:
+            time.sleep(delay)
+        try:
+            return WS(cfg["ip"], cfg["ws_port"], timeout=timeout)
+        except OSError as e:
+            last = e
+    raise OSError(f"printer websocket unreachable after {retries + 1} tries: {last}")
+
+
 def ws_exchange(cfg: dict, messages: list[dict], wait: float = 3.0, until=None) -> dict:
     seen: dict = {}
-    ws = WS(cfg["ip"], cfg["ws_port"], timeout=5)
+    if cfg.get("backend") == "moonraker":
+        raise Fail("this printer uses the Moonraker backend; websocket 9999 commands do not apply")
+    ws = ws_connect(cfg)
     try:
         for m in messages:
             ws.send(json.dumps(m))
@@ -990,9 +1061,12 @@ def normalize_status(d: dict) -> dict:
     err = d.get("err")
     errcode = err.get("errcode") if isinstance(err, dict) else err
     pick = lambda *ks: next((d[k] for k in ks if k in d), None)
+    label = PRINT_STATES.get(st_i, st)
+    if st_i == 0 and str(d.get("deviceState")) == "1":
+        label = "busy"  # seen on a real CR-10 SE while it reheats after a resume (state 0, deviceState 1)
     return {
         "received_at": ts_human(),
-        "state": PRINT_STATES.get(st_i, st),
+        "state": label,
         "state_code": st,
         "device_state": d.get("deviceState"),
         "printing": st_i == 1 or str(d.get("deviceState")) == "1",
@@ -1034,14 +1108,24 @@ def normalize_status(d: dict) -> dict:
     }
 
 
+def printer_state_dir() -> Path:
+    """State for the active fleet printer (classic single printer keeps bots/state/ as before)."""
+    name = active_printer()
+    if not name:
+        return state_dir()
+    d = state_dir() / "printers" / safe_name(name)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _latest_path() -> Path:
-    return state_dir() / "printer_latest.json"
+    return printer_state_dir() / "printer_latest.json"
 
 
 def record_status(norm: dict, raw: dict) -> None:
     """Latest-state JSON (agents read it anytime) + rolling daily log (keeps PR_STREAM_LOG_DAYS, default 7)."""
     atomic_write(_latest_path(), json.dumps({**norm, "raw": raw}, indent=2, default=str))
-    d = state_dir() / "logs"
+    d = printer_state_dir() / "logs"
     d.mkdir(parents=True, exist_ok=True)
     with open(d / f"printer_stream_{now_et():%Y%m%d}.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(norm, default=str) + "\n")
@@ -1054,9 +1138,21 @@ def record_status(norm: dict, raw: dict) -> None:
 
 
 def printer_status(cfg: dict, wait: float = 3.0) -> dict:
-    d = ws_exchange(cfg, [{"method": "get", "params": {"ReqPrinterPara": 1}}], wait=wait,
-                    until=lambda v: "state" in v and "nozzleTemp" in v)
+    if cfg.get("backend") == "moonraker":
+        return _mod("pr_plugins").moonraker_for(cfg).status()
+    d, last = None, None
+    for attempt in range(1 + int(env_float("PR_STATUS_RETRIES", 1))):  # read-only, so a retry is always safe
+        try:
+            d = ws_exchange(cfg, [{"method": "get", "params": {"ReqPrinterPara": 1}}], wait=wait,
+                            until=lambda v: "state" in v and "nozzleTemp" in v)
+        except OSError as e:
+            last, d = e, None
+        if d:
+            break
+        time.sleep(min(2.0, env_float("PR_WS_BACKOFF_S", 0.5)))
     if not d:
+        if last:
+            raise last
         raise Fail("printer websocket answered but sent no status")
     norm = normalize_status(d)
     record_status(norm, d)
@@ -1064,19 +1160,87 @@ def printer_status(cfg: dict, wait: float = 3.0) -> dict:
     return norm
 
 
-def printer_stream(cfg: dict, seconds: float, jsonl: bool, min_interval: float) -> dict:
-    """Subscribe to ws 9999 and merge every push into a live state; emit on change."""
-    ws = WS(cfg["ip"], cfg["ws_port"], timeout=5)
+def assess_continuity(prev: dict | None, cur: dict | None, gap_s: float | None = None) -> list[dict]:
+    """Compare two normalized states (before/after a disconnect or between polls) and name what changed in ways
+    that matter for an unattended farm: lost job, power-loss resume pending, new error, finished while away."""
+    ev: list[dict] = []
+    if not cur:
+        return ev
+    if cur.get("power_loss_recovery") not in (None, 0, "0", ""):
+        ev.append({"kind": "power_loss_resume_pending",
+                   "detail": f"printer reports a power-loss recovery record (repoPlrStatus={cur.get('power_loss_recovery')}); "
+                             "decide resume vs cancel on the printer screen. The remote never auto-resumes."})
+    if not prev:
+        return ev
+    was = bool(prev.get("printing")) and not prev.get("idle")
+    now_idle = bool(cur.get("idle"))
+    if was and now_idle:
+        st = str(cur.get("state"))
+        pct = cur.get("progress_pct") or prev.get("progress_pct") or 0
+        if st == "complete" or (pct or 0) >= 99:
+            ev.append({"kind": "job_finished_while_away", "detail": f"{prev.get('file')} finished ({pct}%)"})
+        else:
+            ev.append({"kind": "job_lost", "detail": f"{prev.get('file')} was printing at {prev.get('progress_pct')}% and the "
+                                                      f"printer is now {st}" + (f" after a {gap_s:.0f} s gap" if gap_s else "")})
+    if cur.get("has_error") and not prev.get("has_error"):
+        ev.append({"kind": "printer_error", "detail": f"error {cur.get('error', {}).get('raw')}"})
+    if prev.get("file") and cur.get("file") and prev.get("file") != cur.get("file") and was:
+        ev.append({"kind": "job_changed", "detail": f"{prev.get('file')} -> {cur.get('file')}"})
+    return ev
+
+
+def printer_stream(cfg: dict, seconds: float, jsonl: bool, min_interval: float, on_update=None) -> dict:
+    """Subscribe to ws 9999 and merge every push into a live state; emit on change. Survives drops: reconnects with
+    backoff until `seconds` run out, re-requests the full state, and reports continuity events (job lost mid-print,
+    power-loss record, new error) across each gap."""
     merged: dict = {}
-    updates = 0
+    updates, reconnects = 0, 0
     last_emit = 0.0
     end = time.monotonic() + seconds
+    events: list = []
+    drops: list = []
+    stale_s = env_float("PR_STREAM_STALE_S", 30)
+    delays = iter(backoff_delays(1000, env_float("PR_WS_BACKOFF_S", 0.5), cap=env_float("PR_WS_BACKOFF_CAP_S", 15)))
+    ws = None
+    last_rx = time.monotonic()
+    before_gap, gap_started = None, None
     try:
-        ws.send(json.dumps({"method": "get", "params": {"ReqPrinterPara": 1}}))
         while time.monotonic() < end:
-            raw = ws.recv(max(0.1, min(2.0, end - time.monotonic())))
-            if raw is None:
+            if ws is None:
+                try:
+                    ws = WS(cfg["ip"], cfg["ws_port"], timeout=min(5.0, max(0.5, end - time.monotonic())))
+                    ws.send(json.dumps({"method": "get", "params": {"ReqPrinterPara": 1}}))
+                    last_rx = time.monotonic()
+                    if gap_started is not None:
+                        reconnects += 1
+                except OSError as e:
+                    if gap_started is None:
+                        gap_started, before_gap = time.monotonic(), (normalize_status(merged) if merged else None)
+                        drops.append({"at": ts_human(), "error": str(e)[:160], "phase": "connect"})
+                    time.sleep(min(next(delays), max(0.0, end - time.monotonic())))
+                    continue
+            try:
+                raw = ws.recv(max(0.1, min(2.0, end - time.monotonic())))
+            except OSError as e:
+                try:
+                    ws.close()
+                except OSError:
+                    pass
+                ws = None
+                gap_started, before_gap = time.monotonic(), (normalize_status(merged) if merged else None)
+                drops.append({"at": ts_human(), "error": str(e)[:160], "phase": "recv"})
                 continue
+            if raw is None:
+                if time.monotonic() - last_rx > stale_s:  # silent socket: treat as dropped
+                    try:
+                        ws.close()
+                    except OSError:
+                        pass
+                    ws = None
+                    gap_started, before_gap = time.monotonic(), (normalize_status(merged) if merged else None)
+                    drops.append({"at": ts_human(), "error": f"no data for {stale_s:.0f} s", "phase": "stale"})
+                continue
+            last_rx = time.monotonic()
             try:
                 d = json.loads(raw)
             except ValueError:
@@ -1088,21 +1252,33 @@ def printer_stream(cfg: dict, seconds: float, jsonl: bool, min_interval: float) 
                 continue
             merged.update(d)
             updates += 1
+            if gap_started is not None and "state" in d:
+                cur = normalize_status(merged)
+                for e in assess_continuity(before_gap, cur, time.monotonic() - gap_started):
+                    events.append({**e, "at": ts_human()})
+                gap_started, before_gap = None, None
+                delays = iter(backoff_delays(1000, env_float("PR_WS_BACKOFF_S", 0.5), cap=env_float("PR_WS_BACKOFF_CAP_S", 15)))
             if time.monotonic() - last_emit >= min_interval:
                 last_emit = time.monotonic()
                 norm = normalize_status(merged)
                 record_status(norm, merged)
+                if on_update:
+                    on_update(norm)
                 if jsonl:
                     sys.stdout.write(json.dumps({"type": "update", **norm}, default=str) + "\n")
                     sys.stdout.flush()
     except KeyboardInterrupt:
         pass
     finally:
-        ws.close()
+        if ws is not None:
+            ws.close()
     if merged:
         record_status(normalize_status(merged), merged)
+        for e in assess_continuity(None, normalize_status(merged)):
+            if not any(x["kind"] == e["kind"] for x in events):
+                events.append({**e, "at": ts_human()})
     return {"updates": updates, "latest": normalize_status(merged) if merged else None,
-            "latest_file": str(_latest_path())}
+            "latest_file": str(_latest_path()), "reconnects": reconnects, "drops": drops, "continuity_events": events}
 
 
 def _tcp_open(ip: str, port: int, t: float | None = None) -> bool:
@@ -1201,6 +1377,8 @@ def cmd_printer(a, out):
 
 
 def upload_gcode(cfg: dict, f: Path, name: str) -> dict:
+    if cfg.get("backend") == "moonraker":
+        return _mod("pr_plugins").moonraker_for(cfg).upload(f, name)
     boundary = "----pr" + uuid.uuid4().hex
     body = io.BytesIO()
     body.write(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n"
@@ -1254,7 +1432,14 @@ def _job_facts(params: dict) -> dict:
 def request_gated(action: str, a, out, reason: str = "", extra: dict | None = None) -> None:
     if not env_bool("PHYSICAL_ACTIONS_ENABLED", True):
         raise Fail("physical actions are switched off (PHYSICAL_ACTIONS_ENABLED=false)")
+    pol = _mod("pr_policy")
+    killed, why = pol.is_killed(active_printer())
+    if killed:
+        pol.audit("request_refused", action=action, printer=active_printer(), detail=f"kill switch: {why}")
+        raise Fail(f"kill switch is on ({why}); clear it with `policy unkill` (owner) first")
     params: dict = {}
+    if active_printer():
+        params["printer"] = active_printer()
     if action == "start":
         params["file"] = safe_name(a.file_on_printer)
         params["gcode_root"] = (getattr(a, "gcode_root", None) or env("PRINTER_GCODE_ROOT") or "/usr/data/printer_data/gcodes")
@@ -1284,8 +1469,22 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
         params.update(filament_move_params(action, a))
     if extra and extra.get("_params"):
         params.update(extra.pop("_params"))
-    rid = f"r{ts_compact()}_{secrets.token_hex(2)}"
     ttl = env_float("APPROVAL_TTL_MIN", env_float("CONFIRM_TTL_MIN", 15))
+    dup = _same_pending(action, params)
+    if dup:  # idempotent: asking twice for the same thing returns the open request instead of a second one
+        out.update(status="awaiting_owner", request_id=dup["request_id"], action=action, params=dup["params"],
+                   summary=dup.get("summary"), duplicate_of_open_request=True,
+                   next=f"already waiting for the owner; only on the owner's own yes/no run `approve {dup['request_id']} --yes` or `--no`")
+        return
+    decision = pol.decide(action, params)
+    if decision["level"] == "notify_only":
+        msg = (f"{reason + '. ' if reason else ''}notify_only policy for printer {active_printer() or 'default'}: "
+               f"printer {action} {json.dumps(params, default=str)[:200]} was NOT sent. Do it by hand if wanted.")
+        pkt = write_packet(f"notice {action}", "notice", msg, {"action": action, "params": params, "policy": decision}, "notified")
+        pol.audit("notify_only", action=action, printer=active_printer(), detail=decision.get("why"))
+        out.update(status="notified", action=action, params=params, policy=decision, packet=str(pkt), summary=msg)
+        return
+    rid = f"r{ts_compact()}_{secrets.token_hex(2)}"
     t = now_et()
     facts = _job_facts(params) if action == "start" else {}
     summary = f"Printer {action}"
@@ -1337,8 +1536,34 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
                expires_in_min=ttl, summary=summary,
                next=f"show the owner the summary; only on the owner's own yes/no run `approve {rid} --yes` or `--no`",
                **attach)
+    pol.audit("request_created", action=action, printer=active_printer(), request_id=rid,
+              detail=f"policy {decision['level']}: {decision.get('why')}")
+    if decision["level"] == "auto_after_preflight":
+        out["policy"] = decision
+        sub = {"status": "ok", "warnings": [], "errors": [], "job_id": out["job_id"]}
+        _approve_request(rid, True, f"policy:{decision['level']}", decision.get("why"), sub)
+        out.update(status=sub["status"], auto=True, preflight=sub.get("preflight"), result=sub.get("result"),
+                   next="executed automatically under the auto_after_preflight policy (audited)"
+                   if sub["status"] == "ok" else "auto policy run did not execute; see errors")
+        out["errors"].extend(sub["errors"])
+        out["warnings"].extend(sub["warnings"])
+        return
     if env_bool("APPROVAL_TELEGRAM", False):
         out["telegram"] = telegram_send(summary, photo)
+    try:
+        _mod("pr_alerts").emit("approval_needed", summary, {"request_id": rid, "action": action, "params": params},
+                               printer=active_printer(), telegram=False)
+    except Exception as e:
+        out["warnings"].append(f"approval_needed alert failed: {str(e)[:120]}")
+
+
+def _same_pending(action: str, params: dict) -> dict | None:
+    for p in _pending_dir().glob("*.json"):
+        r = _read_json(p) or {}
+        if r.get("action") == action and r.get("params") == json.loads(json.dumps(params, default=str)) \
+                and time.time() < r.get("expires_epoch", 0):
+            return r
+    return None
 
 
 def _check(checks: list, name: str, ok, detail: str = "", blocking: bool = True) -> None:
@@ -1350,6 +1575,8 @@ def preflight(action: str, params: dict) -> dict:
     checks: list = []
     _check(checks, "physical_actions_enabled", env_bool("PHYSICAL_ACTIONS_ENABLED", True),
            "PHYSICAL_ACTIONS_ENABLED must be true")
+    killed, why = _mod("pr_policy").is_killed(active_printer())
+    _check(checks, "kill_switch_off", not killed, why or "off")
     cfg = printer_cfg()
     st = None
     try:
@@ -1436,48 +1663,82 @@ def _find_request(rid: str) -> tuple[dict, Path]:
 
 
 def cmd_approve(a, out):
-    req, p = _find_request(a.request_id)
-    answer = "yes" if a.yes else "no"
-    req["answer"] = {"answer": answer, "approved_by": a.by or "owner_chat", "owner_words": a.quote,
-                     "answered_at": ts_human()}
+    _approve_request(a.request_id, bool(a.yes), a.by or "owner_chat", a.quote, out)
+
+
+def _approve_request(request_id: str, yes: bool, by: str, quote: str | None, out: dict) -> None:
+    req, p = _find_request(request_id)
+    answer = "yes" if yes else "no"
+    req["answer"] = {"answer": answer, "approved_by": by or "owner_chat", "owner_words": quote,
+                     "answered_at": ts_human(), "actor": current_actor()}
     out.update(request_id=req["request_id"], action=req["action"], params=req["params"], answer=req["answer"])
     expired = time.time() > req.get("expires_epoch", 0)
     os.replace(p, _answered_dir() / p.name)  # single use
     dst = _answered_dir() / p.name
-    if req["params"].get("queue_id") and (answer == "no" or expired):
-        _queue_set(req["params"]["queue_id"], status="queued", request_id=None)
-    if answer == "no":
-        out["status"] = "declined"
-        req["outcome"] = "declined"
-        atomic_write(dst, json.dumps(req, indent=2, default=str))
-        write_packet(f"{req['action']} declined", "result", f"Owner said no to printer {req['action']}.", req["answer"], "declined")
-        return
-    if expired:
-        req["outcome"] = "expired"
-        atomic_write(dst, json.dumps(req, indent=2, default=str))
-        raise Fail("request expired; ask again")
-    pf = preflight(req["action"], req["params"])
-    out["preflight"] = pf
-    req["preflight"] = pf
-    if not pf["passed"]:
-        req["outcome"] = "preflight_failed"
-        if req["params"].get("queue_id"):
+    prev_printer = active_printer()
+    set_active_printer(req["params"].get("printer") or prev_printer)
+    pol = _mod("pr_policy")
+    try:
+        if req["params"].get("queue_id") and (answer == "no" or expired):
             _queue_set(req["params"]["queue_id"], status="queued", request_id=None)
+        if answer == "no":
+            out["status"] = "declined"
+            req["outcome"] = "declined"
+            atomic_write(dst, json.dumps(req, indent=2, default=str))
+            write_packet(f"{req['action']} declined", "result", f"Owner said no to printer {req['action']}.", req["answer"], "declined")
+            pol.audit("declined", action=req["action"], printer=active_printer(), request_id=req["request_id"], detail=by)
+            return
+        if expired:
+            req["outcome"] = "expired"
+            atomic_write(dst, json.dumps(req, indent=2, default=str))
+            pol.audit("expired", action=req["action"], printer=active_printer(), request_id=req["request_id"])
+            raise Fail("request expired; ask again")
+        if by.startswith("policy:"):
+            ok, why = pol.check_rate(active_printer())
+            if not ok:
+                req["outcome"] = "rate_limited"
+                atomic_write(dst, json.dumps(req, indent=2, default=str))
+                pol.audit("rate_limited", action=req["action"], printer=active_printer(), request_id=req["request_id"], detail=why)
+                out["status"] = "error"
+                out["errors"].append(f"auto policy rate limit reached ({why}); ask the owner instead")
+                return
+        pf = preflight(req["action"], req["params"])
+        out["preflight"] = pf
+        req["preflight"] = pf
+        if not pf["passed"]:
+            req["outcome"] = "preflight_failed"
+            if req["params"].get("queue_id"):
+                _queue_set(req["params"]["queue_id"], status="queued", request_id=None)
+            atomic_write(dst, json.dumps(req, indent=2, default=str))
+            out["status"] = "preflight_failed"
+            msg = f"Owner approved printer {req['action']}, but preflight failed: {', '.join(pf['failed'])}. Nothing was sent."
+            if by.startswith("policy:"):
+                msg = msg.replace("Owner approved", f"Auto policy ({by}) tried")
+            out["errors"].append(msg)
+            write_packet(f"{req['action']} preflight failed", "result", msg, {"preflight": pf}, "preflight_failed", priority="high")
+            pol.audit("preflight_failed", action=req["action"], printer=active_printer(), request_id=req["request_id"],
+                      detail=", ".join(pf["failed"]))
+            return
+        out["result"] = execute_physical(req["action"], req["params"])
+        req["outcome"] = "executed"
+        req["result"] = out["result"]
         atomic_write(dst, json.dumps(req, indent=2, default=str))
-        out["status"] = "preflight_failed"
-        msg = f"Owner approved printer {req['action']}, but preflight failed: {', '.join(pf['failed'])}. Nothing was sent."
-        out["errors"].append(msg)
-        write_packet(f"{req['action']} preflight failed", "result", msg, {"preflight": pf}, "preflight_failed", priority="high")
-        return
-    out["result"] = execute_physical(req["action"], req["params"])
-    req["outcome"] = "executed"
-    req["result"] = out["result"]
-    atomic_write(dst, json.dumps(req, indent=2, default=str))
-    if pf["flagged"]:
-        out["warnings"].append("preflight flags (not blocking): " + ", ".join(pf["flagged"]))
-    write_packet(f"{req['action']} done", "result",
-                 f"Printer {req['action']} executed after owner yes ({req['answer']['approved_by']}) and preflight pass.",
-                 {"action": req["action"], "params": req["params"], "result": out["result"], "preflight": pf}, "ok")
+        pol.audit("auto_executed" if by.startswith("policy:") else "executed", action=req["action"],
+                  printer=active_printer(), request_id=req["request_id"], detail=f"approved_by {by}")
+        if pf["flagged"]:
+            out["warnings"].append("preflight flags (not blocking): " + ", ".join(pf["flagged"]))
+        who = "auto policy" if by.startswith("policy:") else f"owner yes ({by})"
+        write_packet(f"{req['action']} done", "result",
+                     f"Printer {req['action']} executed after {who} and preflight pass.",
+                     {"action": req["action"], "params": req["params"], "result": out["result"], "preflight": pf}, "ok")
+    finally:
+        try:
+            _mod("pr_farm").on_request_outcome(req)
+            if req["params"].get("selftest_step") and req.get("outcome") == "executed":
+                out["selftest"] = _mod("pr_selftest").verify_after(req)
+        except Exception as e:
+            out["warnings"].append(f"post-approval hook: {str(e)[:150]}")
+        set_active_printer(prev_printer)
 
 
 def cmd_preflight(a, out):
@@ -1709,13 +1970,23 @@ def urgent_cooldown(reason: str, source: str, fan: bool = False, cfg: dict | Non
            f"URGENT COOLDOWN FAILED {rec['at']} ({source}): {rec['reason']}. Could not reach the printer "
            f"({rec.get('error')}). Switch the printer off at the power switch.")
     rec["packet"] = str(write_packet("URGENT cooldown", "alert", msg, rec, "ok" if rec["ok"] else "error", priority="high"))
+    try:
+        _mod("pr_policy").audit("urgent_cooldown", action="cooldown", printer=active_printer(),
+                                detail=f"{source}: {rec['reason']} ok={rec['ok']}")
+    except Exception:
+        pass
     return rec
 
 
 def execute_physical(action: str, params: dict) -> dict:
     if not env_bool("PHYSICAL_ACTIONS_ENABLED", True):  # kill switch also covers auto-pause and every caller
         raise Fail("physical actions are switched off (PHYSICAL_ACTIONS_ENABLED=false)")
+    killed, why = _mod("pr_policy").is_killed(params.get("printer") or active_printer())
+    if killed:
+        raise Fail(f"kill switch is on ({why})")
     cfg = printer_cfg()
+    if cfg.get("backend") == "moonraker":
+        return _mod("pr_plugins").moonraker_for(cfg).execute(action, params)
     if action == "start":
         st = printer_status(cfg)
         if st.get("printing"):
@@ -1723,7 +1994,7 @@ def execute_physical(action: str, params: dict) -> dict:
         path = f"{params['gcode_root'].rstrip('/')}/{params['file']}"
         reply = ws_exchange(cfg, [{"method": "set", "params": {"opGcodeFile": f"printprt:{path}"}}], wait=4)
         _watch_reset()
-        rec = on_job_started({**params, "file": params["file"]})
+        rec = on_job_started({**params, "file": params["file"], "printer": active_printer()})
         return {"history_id": rec["id"], "sent": "opGcodeFile", "path": path,
                 "printer_reply": {k: reply.get(k) for k in ("err", "state", "printFileName") if k in reply}}
     if action in ("pause", "resume", "cancel"):
@@ -1776,8 +2047,22 @@ def _pil():
         return None
 
 
+def camera_url(camera: str | None = None) -> str:
+    """Camera URL for the active printer: fleet `cameras` entry (url_env / url) first, then CAMERA_URL."""
+    name = active_printer()
+    if name:
+        u = _mod("pr_fleet").camera_url_for(name, camera)
+        if u:
+            return u
+    elif camera:
+        u = _mod("pr_fleet").camera_url_for(None, camera)
+        if u:
+            return u
+    return env("CAMERA_URL")
+
+
 def camera_enabled() -> bool:
-    return bool(env("CAMERA_URL")) and env_bool("CAMERA_ENABLED", True)
+    return bool(camera_url()) and env_bool("CAMERA_ENABLED", True)
 
 
 def _fetch_frame(url: str) -> bytes:
@@ -1802,12 +2087,13 @@ def _fetch_frame(url: str) -> bytes:
         return r.read(15_000_000)
 
 
-def take_snapshot(label: str = "snap") -> dict:
-    if not env("CAMERA_URL"):
-        raise Fail("CAMERA_URL not set")
+def take_snapshot(label: str = "snap", camera: str | None = None) -> dict:
+    url = camera_url(camera)
+    if not url:
+        raise Fail("CAMERA_URL not set (or no camera configured for this printer)")
     t = now_et()
-    raw = _fetch_frame(env("CAMERA_URL"))
-    d = state_dir() / "snapshots"
+    raw = _fetch_frame(url)
+    d = printer_state_dir() / "snapshots"
     d.mkdir(parents=True, exist_ok=True)
     stem = f"{safe_name(label)}_{ts_compact(t)}_ET"
     raw_path = d / "raw" / f"{stem}.jpg"
@@ -1865,7 +2151,7 @@ def image_diff(a_path: str, b_path: str) -> float | None:
 
 
 def reference_path() -> Path:
-    return state_dir() / "camera" / "empty_bed_reference.jpg"
+    return printer_state_dir() / "camera" / "empty_bed_reference.jpg"
 
 
 def bed_check(raw_path: str | None) -> dict:
@@ -1902,7 +2188,7 @@ def cmd_camera(a, out):
         out["reference"] = str(ref)
         out["set_at"] = ts_human()
         return
-    snap = take_snapshot(a.label if a.camera_cmd == "snapshot" else "bed_check")
+    snap = take_snapshot(a.label if a.camera_cmd == "snapshot" else "bed_check", getattr(a, "camera", None))
     out["snapshot"] = snap
     if a.camera_cmd == "bed-check":
         out["bed_check"] = bed_check(snap["raw_path"])
@@ -1911,7 +2197,7 @@ def cmd_camera(a, out):
 
 # ============================================================ malfunction watch
 def _watch_file() -> Path:
-    return state_dir() / "watch_state.json"
+    return printer_state_dir() / "watch_state.json"
 
 
 def _watch_reset() -> None:
@@ -2238,7 +2524,8 @@ def cmd_gcode(a, out):
 # ============================================================ history
 def on_job_started(params: dict) -> dict:
     hist = load_store("history", [])
-    rec = {"id": f"h{len(hist) + 1:04d}", "file": params.get("file"), "started_at": ts_human(),
+    rec = {"id": f"h{len(hist) + 1:04d}", "file": params.get("file"), "printer": params.get("printer"),
+           "farm_job_id": params.get("farm_job_id"), "started_at": ts_human(),
            "started_epoch": time.time(), "result": "printing", "queue_id": params.get("queue_id"),
            "local_gcode": params.get("local_gcode"), "color": params.get("color"), "material": params.get("material")}
     if params.get("local_gcode") and Path(params["local_gcode"]).is_file():
@@ -2254,13 +2541,17 @@ def on_job_started(params: dict) -> dict:
     return rec
 
 
-def open_job() -> dict | None:
-    return next((h for h in reversed(load_store("history", [])) if h.get("result") == "printing"), None)
+def open_job(printer: str | None = "__active__") -> dict | None:
+    pn = active_printer() if printer == "__active__" else printer
+    return next((h for h in reversed(load_store("history", []))
+                 if h.get("result") == "printing" and (h.get("printer") or None) == (pn or None)), None)
 
 
-def on_job_finished(result: str, status: dict | None, photo: str | None, note: str = "") -> dict | None:
+def on_job_finished(result: str, status: dict | None, photo: str | None, note: str = "",
+                    printer: str | None = "__active__") -> dict | None:
     hist = load_store("history", [])
-    rec = next((h for h in reversed(hist) if h.get("result") == "printing"), None)
+    pn = active_printer() if printer == "__active__" else printer
+    rec = next((h for h in reversed(hist) if h.get("result") == "printing" and (h.get("printer") or None) == (pn or None)), None)
     if rec is None:
         return None
     rec.update(result=result, ended_at=ts_human(), ended_epoch=time.time(),
@@ -2268,10 +2559,11 @@ def on_job_finished(result: str, status: dict | None, photo: str | None, note: s
     if status and status.get("elapsed_s"):
         rec["duration_s"] = int(status["elapsed_s"])
     save_store("history", hist)
-    m = load_store("maintenance", {})
-    m["print_hours"] = round(m.get("print_hours", 0) + rec["duration_s"] / 3600, 3)
-    m["prints"] = m.get("prints", 0) + 1
-    save_store("maintenance", m)
+    if not pn:  # classic single-printer maintenance counter; fleet printers count from history (ops maint)
+        m = load_store("maintenance", {})
+        m["print_hours"] = round(m.get("print_hours", 0) + rec["duration_s"] / 3600, 3)
+        m["prints"] = m.get("prints", 0) + 1
+        save_store("maintenance", m)
     if rec.get("queue_id"):
         _queue_set(rec["queue_id"], status="done" if result == "success" else "failed")
     if result == "success" and rec.get("est_g") and rec.get("color"):
@@ -2935,8 +3227,10 @@ def watch_job_events(status: dict, ws_state: dict, snap: dict | None, result: di
 
 # ============================================================ CLI
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="printer_remote", description="Creality Print + CR-10 SE agent bridge (JSON out)")
+    p = argparse.ArgumentParser(prog="printer_remote", description="Creality Print + Creality OS farm control plane (JSON out)")
     p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("--printer", dest="printer_global", help="fleet printer name for any command (see printers.json)")
+    p.add_argument("--actor", help="who is acting, for the audit log (default PR_ACTOR or 'cli')")
     sp = p.add_subparsers(dest="cmd", required=True)
     sp.add_parser("detect", help="find Creality Print, presets, GUI state, printer IP")
 
@@ -3032,6 +3326,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name, sub_p in ps.choices.items():  # --urgent is cooldown-only; elsewhere it is accepted and refused clearly
         if name != "cooldown":
             sub_p.add_argument("--urgent", action="store_true", help=argparse.SUPPRESS)
+        sub_p.add_argument("--printer", dest="printer_name", default=argparse.SUPPRESS,
+                           help="fleet printer name from printers.json (default: the single PRINTER_IP printer)")
     x = sp.add_parser("approve", help="record the OWNER's yes/no for a request; yes runs preflight, then executes")
     x.add_argument("request_id")
     g = x.add_mutually_exclusive_group(required=True)
@@ -3045,17 +3341,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     cp = sp.add_parser("camera", help="snapshot / empty-bed reference / bed-clear check").add_subparsers(dest="camera_cmd", required=True)
     x = cp.add_parser("snapshot")
+    x.add_argument("--camera", help="camera name from the printer's `cameras` list in printers.json")
     x.add_argument("--label", default="snap")
     x = cp.add_parser("set-reference")
     x.add_argument("--from-file", dest="from_file")
     cp.add_parser("bed-check")
 
+    for _n, _c in cp.choices.items():
+        _c.add_argument("--printer", dest="printer_name", default=argparse.SUPPRESS, help="fleet printer name")
     x = sp.add_parser("watch", help="malfunction watch: snapshots + heuristics -> owner_inbox/Telegram alerts")
     x.add_argument("--once", action="store_true", help="one tick (for a scheduled job)")
     x.add_argument("--interval", type=int, default=int(env("WATCH_INTERVAL_S") or 120))
     x.add_argument("--max-minutes", dest="max_minutes", type=float, default=720)
     x.add_argument("--stop-when-idle", dest="stop_when_idle", action="store_true")
     x.add_argument("--reset", action="store_true")
+    x.add_argument("--printer", dest="printer_name", default=argparse.SUPPRESS, help="fleet printer name")
     x = sp.add_parser("gcode", help="inspect a gcode file: temps, layers, time, grams, cost, warnings")
     gsp = x.add_subparsers(dest="gcode_cmd", required=True)
     y = gsp.add_parser("inspect")
@@ -3086,7 +3386,7 @@ def build_parser() -> argparse.ArgumentParser:
         y.add_argument("--grams", type=float, required=True)
     y = fp.add_parser("archive")
     y.add_argument("id")
-    for n, h in (("extrude", "gated: preheat (300 C default) then push filament"),
+    for n, h in (("extrude", "gated: preheat (PETG 240 default) then push filament"),
                  ("retract", "gated: preheat then pull filament back"),
                  ("load", "gated: preheat, feed and purge (color swap)"),
                  ("unload", "gated: preheat, small purge, pull filament out (color swap)")):
@@ -3165,6 +3465,7 @@ def build_parser() -> argparse.ArgumentParser:
     x = sp.add_parser("health", help="one summary of everything for the agent")
     x.add_argument("--probe", action="store_true", help="refresh live printer data first")
     x.add_argument("--packet", action="store_true", help="also write an owner_inbox report packet")
+    register_farm_modules(sp, HANDLERS)
     return p
 
 
@@ -3175,12 +3476,25 @@ HANDLERS = {"gcode": cmd_gcode, "history": cmd_history, "filament": cmd_filament
             "pending": cmd_pending, "camera": cmd_camera, "watch": cmd_watch}
 
 
+FARM_MODULES = ("pr_fleet", "pr_farm", "pr_policy", "pr_security", "pr_alerts", "pr_service", "pr_ops",
+                "pr_plugins", "pr_selftest")
+
+
+def register_farm_modules(sp, handlers: dict) -> None:
+    for m in FARM_MODULES:
+        _mod(m).register(sp, handlers)
+
+
 def main(argv=None) -> int:
     load_env()
-    args = build_parser().parse_args(argv)
+    sys.modules.setdefault("printer_remote", sys.modules[__name__])
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    set_active_printer(getattr(args, "printer_name", None) or getattr(args, "printer_global", None) or env("PR_PRINTER"))
+    set_actor(getattr(args, "actor", None))
     sub = next((getattr(args, k) for k in ("presets_cmd", "printer_cmd", "camera_cmd", "gcode_cmd", "history_cmd",
                                            "filament_cmd", "queue_cmd", "plates_cmd", "maint_cmd", "library_cmd",
-                                           "timelapse_cmd") if getattr(args, k, None)), None)
+                                           "timelapse_cmd") + tuple(FARM_SUBCMD_DESTS) if getattr(args, k, None)), None)
     out = {"status": "ok", "job_id": new_job_id(), "command": args.cmd + (f" {sub}" if sub else ""),
            "started_at": now_et().isoformat(timespec="seconds"), "errors": [], "warnings": []}
     code = 0
@@ -3200,6 +3514,9 @@ def main(argv=None) -> int:
     sys.stdout.write(json.dumps(out, indent=None if jsonl else 2, default=str) + "\n")
     return code
 
+
+FARM_SUBCMD_DESTS = ("fleet_cmd", "farm_cmd", "policy_cmd", "audit_cmd", "token_cmd", "alerts_cmd", "ops_cmd",
+                     "slicer_cmd", "detect_cmd", "playbook_cmd", "selftest_cmd", "maint2_cmd", "spool_cmd")
 
 if __name__ == "__main__":
     sys.exit(main())

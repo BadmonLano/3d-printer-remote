@@ -1,0 +1,38 @@
+{
+  "_comment": "Copy to policy.json to opt in. Without policy.json every action needs the owner's yes (owner_yes).",
+  "default": "owner_yes",
+  "printers": {
+    "se2": "notify_only"
+  },
+  "groups": {
+    "petg": "owner_yes"
+  },
+  "profiles": {
+    "petg-trusted": {
+      "level": "auto_after_preflight",
+      "materials": [
+        "PETG"
+      ],
+      "printers": [
+        "se1"
+      ]
+    }
+  },
+  "auto_actions": [
+    "start"
+  ],
+  "rate_limits": {
+    "auto_per_hour": 6,
+    "auto_per_printer_per_hour": 3
+  },
+  "playbooks": {
+    "spaghetti": [
+      "notify",
+      "pause",
+      "requeue"
+    ],
+    "default": [
+      "notify"
+    ]
+  }
+}

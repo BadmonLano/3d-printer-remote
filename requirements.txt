@@ -2,4 +2,6 @@
 # Core CLI is standard library only: slicing, presets, LAN upload, websocket, confirm gate, Telegram alerts.
 # Optional (camera): timestamp burn-in on snapshots, empty-bed check and frame-diff watch.
 pillow>=10
+# Optional (fleet): printers.yaml instead of printers.json
+# pyyaml>=6
 numpy>=1.26

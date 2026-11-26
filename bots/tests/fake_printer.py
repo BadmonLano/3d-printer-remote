@@ -27,6 +27,12 @@ class FakePrinter:
                        "modelFanPct": 0, "auxiliaryFanPct": 0, "caseFanPct": 0,
                        "curPosition": "X:0.00 Y:0.00 Z:0.00"}
         self.push_interval = 0.3  # live pushes like Creality OS
+        # chaos controls (tests/test_chaos.py)
+        self.refuse = 0          # close the next N connections before the handshake
+        self.silent = False      # stop pushing and stop answering (stalled printer)
+        self.garbage = False     # send a non-JSON frame before each push
+        self.connections = 0
+        self._clients: list = []
         self.heat_rate = 60.0  # C per push toward the nozzle target (0 = heater never warms up)
         self._http = None
         self._ws_sock = None
@@ -64,7 +70,31 @@ class FakePrinter:
         return H
 
     # ---------------- WS
+    def drop_clients(self):
+        """Simulate Wi-Fi loss: hard-close every live websocket."""
+        for c in list(self._clients):
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                c.close()
+            except OSError:
+                pass
+        self._clients.clear()
+
+    def power_loss(self):
+        """Simulate a power cut mid-print: connections die, printer comes back idle with a recovery record."""
+        self.drop_clients()
+        self.status.update(state=0, deviceState=0, repoPlrStatus=1, powerLoss=1, targetNozzleTemp=0, targetBedTemp0=0)
+
     def _ws_client(self, conn: socket.socket):
+        self.connections += 1
+        if self.refuse > 0:
+            self.refuse -= 1
+            conn.close()
+            return
+        self._clients.append(conn)
         try:
             data = b""
             while b"\r\n\r\n" not in data:
@@ -79,6 +109,13 @@ class FakePrinter:
 
             def pusher():
                 while not stop.wait(self.push_interval):
+                    if self.silent:
+                        continue
+                    if self.garbage:
+                        try:
+                            self._send(conn, "not json {{")
+                        except OSError:
+                            return
                     cur, tgt = float(self.status["nozzleTemp"]), float(self.status["targetNozzleTemp"] or 25)
                     if self.heat_rate and getattr(self, '_heater_driven', False) and abs(tgt - cur) > 0.01:
                         step = min(self.heat_rate, abs(tgt - cur))
@@ -93,7 +130,7 @@ class FakePrinter:
                 msg = self._recv(conn)
                 if msg is None:
                     break
-                if msg == "ok":
+                if msg == "ok" or self.silent:
                     continue
                 try:
                     d = json.loads(msg)
@@ -120,6 +157,14 @@ class FakePrinter:
                     self.status.update(state=1, deviceState=1, printFileName=params["opGcodeFile"].split("/")[-1])
                 if params.get("pause") == 1:
                     self.status.update(state=5)
+                if params.get("pause") == 0 and self.status.get("state") == 5:
+                    self.status.update(state=1)
+                if "lightSw" in params:
+                    self.status["lightSw"] = params["lightSw"]
+                if g.startswith("M106 S"):
+                    self.status["modelFanPct"] = round(int(float(g[6:])) * 100 / 255)
+                if g.startswith("G1 ") and "Z" in g:
+                    self._move_z(g)
                 if params.get("stop") == 1:
                     self.status.update(state=4, deviceState=0)
                 self._send(conn, json.dumps(self.status))
@@ -130,7 +175,20 @@ class FakePrinter:
                 stop.set()
             except NameError:
                 pass
+            if conn in self._clients:
+                self._clients.remove(conn)
             conn.close()
+
+    def _move_z(self, g):
+        import re
+        m = re.search(r"Z(-?[\d.]+)", g)
+        if not m:
+            return
+        cur = re.search(r"Z:(-?[\d.]+)", self.status["curPosition"])
+        z = float(cur.group(1)) if cur else 0.0
+        rel = any(isinstance(x, dict) and x.get("params", {}).get("gcodeCmd") == "G91" for x in self.ws_messages[-3:])
+        nz = z + float(m.group(1)) if rel else float(m.group(1))
+        self.status["curPosition"] = re.sub(r"Z:-?[\d.]+", f"Z:{nz:.2f}", self.status["curPosition"])
 
     @staticmethod
     def _send(conn, text):
@@ -184,7 +242,12 @@ class FakePrinter:
     def stop(self):
         self._http.shutdown()
         self._http.server_close()
+        try:
+            self._ws_sock.shutdown(socket.SHUT_RDWR)  # wake the accept() thread so the port really closes
+        except OSError:
+            pass
         self._ws_sock.close()
+        self.drop_clients()
 
 
 if __name__ == "__main__":

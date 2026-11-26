@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.0.0: farm control plane (opt-in; default behavior unchanged)
+
+> Hardware: on one real CR-10 SE, pause, resume, fan, heat (mid-print) and light now pass too (2026-11-26, during a
+> running print, owner OK). Every new 2.0 feature below is tested against fake printers only. See docs/LIMITS.md.
+
+- **Hardening:** websocket connects retry with exponential backoff (`PR_WS_CONNECT_RETRIES`, `PR_WS_BACKOFF_S`);
+  status reads retry once (read-only, so always safe); failed handshakes close their socket. `printer stream`
+  reconnects after drops or silence and reports `reconnects`, `drops` and `continuity_events` (job lost mid-print,
+  finished while away, power-loss record pending, new error). Gated requests are idempotent (asking twice returns the
+  open request). The resume reheat (state 0 + deviceState 1) is labelled `busy`, not `idle`.
+- **`selftest hardware`:** checklist of every action not yet proven on hardware; `--run <step>` makes a normal gated
+  request (never auto), verifies the result after the owner's yes and writes it to `docs/PROTOCOL.md` (IPs scrubbed);
+  `--record` for what the owner saw.
+- **Fleet:** `printers.json` (or `printers.yaml` with PyYAML), IPs only via `ip_env` or the gitignored
+  `printers.local.json`; `--printer <name>` on printer/camera/watch commands (or globally); per-printer state;
+  `fleet list/status/stream/add/set/remove`; read-only `fleet discover` (port 9999 scan + one status read).
+- **Farm queue:** `farm add/intake/plan/dispatch/sync/done/fail/cancel/release/priority`. Routing by material, color,
+  nozzle, bed fit (with rotation), availability and priority, scarcity-aware, with dependencies, N copies across the
+  farm, batch affinity and failover to another printer (`--max-attempts`). Every start goes through the approval gate.
+  Orders from CSV/JSON (idempotent per order id + file).
+- **Autonomy policies:** `policy.json` (opt-in) with `owner_yes` (default), `auto_after_preflight` (trusted profiles;
+  only start/pause/resume/cooldown, only those in `auto_actions`) and `notify_only`, per printer, group or profile;
+  global and per-printer kill switch (`policy kill/unkill`; urgent cooldown still works); auto rate limits; audit log
+  (`audit`) of every request, answer, auto run, kill, token and API call.
+- **Service:** `serve` runs a supervised daemon (fleet poller with continuity events and playbooks, farm sync, optional
+  auto-dispatch, optional camera watch), pid file, `/api/health`, a local dashboard and a JSON REST API. Binds to
+  127.0.0.1; a LAN bind needs an owner/operator token. `serve --status / --stop`.
+- **Security:** `token create/list/revoke` (PBKDF2 hashes in `bots/state/tokens.json`), roles owner / operator /
+  viewer, actor recorded on every audit entry. SECURITY.md has network isolation advice.
+- **Alerts:** webhook adapter (json / slack / discord, optional HMAC signature, retries) plus the existing Telegram
+  adapter; events done, failed, anomaly, approval_needed, filament_low, maintenance_due; dedupe window.
+- **Operations:** `ops maint` (machine-hour maintenance per printer, per-printer overrides, optional dispatch block),
+  `ops spool` (spool locations; moving a spool onto a printer sets its loaded material/color), `ops analytics`
+  (utilization, success rate, machine hours, cost per part).
+- **Plugins:** `slicer` (Creality Print + OrcaSlicer / PrusaSlicer stubs), `detector` (imagediff + ML hook for an
+  Obico-style server), `playbook` (notify / pause / cooldown / cancel / requeue, policy-gated; urgent cooldown only for
+  thermal/error kinds), multi-camera per printer, Moonraker backend stub.
+- **Code layout:** `bots/printer_remote.py` stays the one CLI entry; the farm features live in `bots/pr_*.py` modules it
+  loads (the single file was already 3,200 lines). Tests: 59 -> 139 (chaos, fleet, farm, policy, service, ops).
+
 ## 1.2.2
 - Docs: the test command is `python -m unittest discover -s bots/tests -v` (README, SETUP, CONTRIBUTING, SKILL).
   `python -m pytest bots/tests` failed on a fresh clone because pytest wasn't installed; it's now optional through the

@@ -31,6 +31,21 @@ bots/comms/
 *.lock
 *.gcode
 
+# 2.0 farm config (owner-specific; examples ship)
+# tokens and the audit log live in bots/state/ (already ignored); keep names explicit too
+tokens.json
+audit.jsonl
+audit.log
+printers.json
+printers.yaml
+printers.yml
+printers.local.json
+policy.json
+orders*.csv
+!printers.example.json
+!policy.example.json
+!orders.example.csv
+
 # python / caches
 __pycache__/
 *.py[cod]

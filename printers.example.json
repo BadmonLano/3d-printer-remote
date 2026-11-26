@@ -1,0 +1,50 @@
+{
+  "printers": [
+    {
+      "name": "se1",
+      "model": "CR-10 SE",
+      "nozzle_mm": 0.4,
+      "material": "PETG",
+      "color": "white",
+      "bed_mm": [
+        220,
+        220,
+        250
+      ],
+      "groups": [
+        "petg"
+      ],
+      "tags": [
+        "toys"
+      ],
+      "ip_env": "PRINTER_IP_SE1",
+      "cameras": [
+        {
+          "name": "top",
+          "url_env": "CAMERA_URL_SE1"
+        }
+      ],
+      "backend": "creality_ws",
+      "maintenance": {
+        "nozzle_check": 200
+      }
+    },
+    {
+      "name": "se2",
+      "model": "CR-10 SE",
+      "nozzle_mm": 0.4,
+      "material": "PLA",
+      "color": "black",
+      "bed_mm": [
+        220,
+        220,
+        250
+      ],
+      "groups": [
+        "pla"
+      ],
+      "ip_env": "PRINTER_IP_SE2",
+      "backend": "creality_ws"
+    }
+  ]
+}
