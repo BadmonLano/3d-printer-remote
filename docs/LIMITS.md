@@ -3,8 +3,9 @@
 **Not yet hardware-verified on a CR-10 SE** for uploads and physical actions. Verified against real hardware:
 Creality Print 7.2 detection, presets, settings files built from real presets, split-check on a real 3MF, and (on
 2026-11-26, read-only) `printer probe`, `status`, `info`, `files`, `history`, `config`, `mesh` and `objects` on a real
-CR-10 SE. Upload, start, pause, resume, cancel, heat, home, move, fan, light and the gcode console have only run
-against the fake printer. Details: docs/PROTOCOL.md, "Observed on hardware".
+CR-10 SE, plus one owner-approved `filament retract` (heat to 300 C, pull 10 mm, nozzle off), which worked. Upload,
+start, pause, resume, cancel, heat, home, move, fan, light, extrude, load, unload and the gcode console have only
+run against the fake printer. Details: docs/PROTOCOL.md, "Observed on hardware".
 
 ## Printer protocol
 - Stock Creality OS LAN flow (HTTP `POST /upload/<file>` on port 80, websocket on 9999) is documented by community

@@ -23,6 +23,8 @@ Include what you found, how to reproduce it, and what an attacker could do with 
   sane temps, file on the printer, filament on hand, and the camera bed check. Failures stop the action.
 - Requests are single use and expire (15 min by default). `PHYSICAL_ACTIONS_ENABLED=false` blocks every physical
   action, including `AUTO_PAUSE_ON_ANOMALY`; the check sits inside the function that talks to the printer.
+- Filament moves: preheat at most 320 C (the printer's max), limited mm per command and speed, refused mid-print,
+  and the nozzle is always set back to 0 on success (unless `--hold`) or on any failure.
 - Move limits: absolute moves stay inside the bed (`BED_X_MM`, `BED_Y_MM`, `MAX_Z_MM`), relative moves stay at or
   under 50 mm per axis, and nothing moves while a print is running (unless it's paused).
 

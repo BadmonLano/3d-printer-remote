@@ -64,4 +64,10 @@ Unit: model `F003`, firmware string `DWIN hw ver:F003;DWIN sw ver:V1.1.0.28`, Wi
 - Normalized since 1.1.0: `idle`, `firmware_version`, `light_on` (lightSw), `storage_present` (tfCard),
   `filament_sensor` (materialDetect/materialStatus), `used_material_mm`, `realtime_speed_mm_s`, `realtime_flow_mm3_s`,
   `power_loss_recovery` (repoPlrStatus), `print_id`, `camera_on_printer` (video/video1).
-- **Not tried** (by design): upload, start, pause, resume, cancel, heat, home, move, fan, light, any gcodeCmd.
+- **First physical action, approved by the owner (2026-11-26 13:29 ET): `filament retract --mm 10 --speed 2`.**
+  `gcodeCmd` works on the SE: `M104 S300` set the target at once (`targetNozzleTemp` 300), the nozzle went from
+  24.1 C to 296+ C in about 80 s (about 5 C/s at its fastest), reached 300 C, `M83` / `G1 E-10 F120` / `M82` were
+  accepted, and `M104 S0` set the target back to 0. 97 s total. 30 s later the nozzle read 222 C with target 0, idle,
+  no error. Pushes arrive every ~2 s while heating.
+- **Not tried yet:** upload, start, pause, resume, cancel, heat (as its own command), home, move, fan, light,
+  extrude, load, unload.

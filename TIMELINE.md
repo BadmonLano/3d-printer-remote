@@ -2,6 +2,9 @@
 
 Version history, newest first. Details: [CHANGELOG.md](CHANGELOG.md).
 
+## v1.2.0: filament control
+- Owner-approved extrude, retract, load and unload with a 300 C preheat, plus cooldown.
+
 ## v1.1.0: owner approval + jobs
 - Owner yes/no in chat plus automatic preflight for every physical action; gated move/home/fan; print queue with
   filament swaps, history, cost, inventory, maintenance, gcode inspector, job notices, health report. Not yet

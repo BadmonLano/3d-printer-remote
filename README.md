@@ -18,7 +18,10 @@ built-in Wi-Fi). Your AI agent (Grok Bot, Cursor, a custom agent...) runs one Py
   tracker with a jam log, a file library, a gcode inspector, and a health report.
 - **Camera (optional):** ET-timestamped snapshots, a bed-clear check, a first-layer photo, a done photo with a
   "clear the bed" reminder, timelapse build, and a malfunction watch with owner_inbox / Telegram alerts.
-- **Owner approval:** start, pause, resume, cancel, heat, home, move, fan and motion/heat gcode never run on the first
+- **Filament:** extrude, retract, load and unload. Each one preheats the nozzle to 300 C first (melts hardened filament in
+  the tip), moves the filament slowly, then turns the nozzle off (or `--hold`). Limits: 100 mm per extrude or retract,
+  120 mm per load or unload.
+- **Owner approval:** start, pause, resume, cancel, heat, home, move, fan, cooldown, filament moves and motion/heat gcode never run on the first
   call. They create a request (`awaiting_owner`) with a summary. **The owner answers YES or NO in chat.** On yes the
   agent runs `approve <id> --yes`, an automatic **preflight** checks the printer, and the action runs only if preflight
   passes.
@@ -37,6 +40,7 @@ python bots\printer_remote.py printer upload "...\plate_1.gcode" --name egg_set.
 python bots\printer_remote.py printer start egg_set.gcode --color white --material PETG   # -> awaiting_owner
 #   agent shows the summary, owner says "yes"
 python bots\printer_remote.py approve r20261126_141500_ab12 --yes --by owner_chat --quote "yes"
+python bots\printer_remote.py filament retract --mm 10 --speed 2                         # -> awaiting_owner
 python bots\printer_remote.py watch --interval 120 --stop-when-idle
 ```
 
@@ -68,7 +72,8 @@ Setup: [SETUP.md](SETUP.md). Agent skill: [skills/printer-remote/SKILL.md](skill
 | `printer files/history/mesh/objects/timelapses/config/ota/materials` | read-only printer queries | no |
 | `printer upload` | store gcode on the printer (does not print) | no |
 | `printer gcode <line>` | M105/M114/M115/M119/M27/M31/M503/M20 free | anything else does |
-| `printer start/pause/resume/cancel/heat/home/move/fan`, `printer light` | physical actions | **yes** (light: no) |
+| `printer start/pause/resume/cancel/heat/home/move/fan/cooldown`, `printer light` | physical actions | **yes** (light: no) |
+| `filament extrude --mm N` / `retract --mm N` / `load` / `unload` | preheat to 300 C (default), wait within 3 C, move filament (M83, then M82), nozzle off | **yes** |
 | `approve <id> --yes/--no`, `preflight <id>`, `pending` | owner answer, go/no-go checks, open requests | - |
 | `camera snapshot/set-reference/bed-check` | camera | no |
 | `watch [--once]` | malfunction watch, job events, alerts | pause asks the owner unless AUTO_PAUSE_ON_ANOMALY=true |

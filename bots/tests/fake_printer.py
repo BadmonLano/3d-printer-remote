@@ -27,6 +27,7 @@ class FakePrinter:
                        "modelFanPct": 0, "auxiliaryFanPct": 0, "caseFanPct": 0,
                        "curPosition": "X:0.00 Y:0.00 Z:0.00"}
         self.push_interval = 0.3  # live pushes like Creality OS
+        self.heat_rate = 60.0  # C per push toward the nozzle target (0 = heater never warms up)
         self._http = None
         self._ws_sock = None
         self.http_port = self.ws_port = 0
@@ -78,6 +79,10 @@ class FakePrinter:
 
             def pusher():
                 while not stop.wait(self.push_interval):
+                    cur, tgt = float(self.status["nozzleTemp"]), float(self.status["targetNozzleTemp"] or 25)
+                    if self.heat_rate and getattr(self, '_heater_driven', False) and abs(tgt - cur) > 0.01:
+                        step = min(self.heat_rate, abs(tgt - cur))
+                        self.status["nozzleTemp"] = f"{cur + (step if tgt > cur else -step):.6f}"
                     try:
                         self._send(conn, json.dumps(self.status))
                     except OSError:
@@ -105,6 +110,12 @@ class FakePrinter:
                 if d.get("method") == "get" and "reqHistory" in params:
                     self._send(conn, json.dumps({"historyList": [{"filename": "old.gcode", "printfinish": 1}]}))
                     continue
+                g = str(params.get("gcodeCmd", ""))
+                if g.startswith("M104 S"):
+                    self.status["targetNozzleTemp"] = int(float(g[6:]))
+                    self._heater_driven = True  # only simulate heating once a test sent M104
+                if g.startswith("M140 S"):
+                    self.status["targetBedTemp0"] = int(float(g[6:]))
                 if "opGcodeFile" in params:
                     self.status.update(state=1, deviceState=1, printFileName=params["opGcodeFile"].split("/")[-1])
                 if params.get("pause") == 1:

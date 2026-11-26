@@ -135,7 +135,7 @@ class TestOffline(Base):
         self.assertTrue(Path(o["packet"]).is_file())
 
 
-class TestWithPrinter(Base):
+class PrinterBase(Base):
     def setUp(self):
         super().setUp()
         self.fp = FakePrinter().start()
@@ -152,6 +152,8 @@ class TestWithPrinter(Base):
         self.fp.stop()
         super().tearDown()
 
+
+class TestWithPrinter(PrinterBase):
     def test_queue_swap_flow_history_and_done_notice(self):
         white = gfile(self.tmp, "white.gcode", GCODE.replace("M600\n", ""))
         red = gfile(self.tmp, "red.gcode", GCODE.replace("M600\n", ""))
@@ -234,7 +236,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
-class TestGateSecurity(TestWithPrinter):
+class TestGateSecurity(PrinterBase):
     """Kill switch covers auto-pause; gated move; probe reports unreachable; no confirm-code machinery left."""
 
     def test_no_code_in_request(self):
@@ -273,3 +275,65 @@ class TestGateSecurity(TestWithPrinter):
         o = self.run_cli("printer", "probe")
         self.assertEqual(o["status"], "error", o)
         self.assertIn("not reachable", " ".join(o["errors"]))
+
+
+class TestFilamentMoves(PrinterBase):
+    """1.2.0: gated extrude / retract / load / unload with 300 C preheat, and cooldown."""
+
+    def gsent(self):
+        return [m.get("params", {}).get("gcodeCmd") for m in self.fp.ws_messages if "gcodeCmd" in m.get("params", {})]
+
+    def setUp(self):
+        super().setUp()
+        self.env.update({"FILAMENT_SOAK_S": "0", "FILAMENT_HEAT_TIMEOUT_S": "20"})
+
+    def test_bounds(self):
+        self.assertEqual(self.run_cli("filament", "extrude")["status"], "error")
+        self.assertEqual(self.run_cli("filament", "extrude", "--mm", "150")["status"], "error")
+        self.assertEqual(self.run_cli("filament", "retract", "--mm", "10", "--temp", "330")["status"], "error")
+        self.assertEqual(self.run_cli("filament", "retract", "--mm", "10", "--speed", "50")["status"], "error")
+        o = self.run_cli("filament", "retract", "--mm", "10")
+        self.assertEqual(o["status"], "awaiting_owner", o)
+        self.assertEqual(o["params"]["temp"], 300.0)
+        self.assertIn("heat nozzle to 300 C", o["summary"])
+        self.assertIn("nozzle off", o["summary"])
+        self.assertEqual(self.gsent(), [], "nothing sent before the owner's yes")
+
+    def test_retract_preheats_moves_and_cools(self):
+        o = self.run_cli("filament", "retract", "--mm", "10", "--speed", "10")
+        r = self.run_cli("approve", o["request_id"], "--yes", "--by", "owner_chat", "--quote", "test the retract")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(self.gsent(), ["M104 S300", "M83", "G1 E-10 F600", "M82", "M104 S0"])
+        res = r["result"]
+        self.assertTrue(res["completed"])
+        self.assertEqual(res["nozzle_target_set_to"], 0)
+        self.assertGreaterEqual(max(t["nozzle"] for t in res["timeline"]), 297)
+        self.assertIn("reached_temp_after_s", res)
+
+    def test_unload_chunks_and_hold(self):
+        o = self.run_cli("filament", "unload", "--speed", "10", "--hold")
+        self.assertEqual(o["params"]["chunks"], [5.0, -45.0, -35.0])
+        self.run_cli("approve", o["request_id"], "--yes")
+        g = self.gsent()
+        self.assertEqual(g[:5], ["M104 S300", "M83", "G1 E5 F600", "G1 E-45 F600", "G1 E-35 F600"])
+        self.assertNotIn("M104 S0", g, "--hold keeps the nozzle hot")
+
+    def test_heat_timeout_turns_nozzle_off(self):
+        self.fp.heat_rate = 0
+        o = self.run_cli("filament", "extrude", "--mm", "5")
+        r = self.run_cli("approve", o["request_id"], "--yes", FILAMENT_HEAT_TIMEOUT_S="2")
+        self.assertEqual(r["status"], "error", r)
+        g = self.gsent()
+        self.assertEqual(g, ["M104 S300", "M104 S0"])
+        self.assertTrue(any("filament extrude stopped" in p.name for p in self.packets()))
+
+    def test_refused_while_printing_and_cooldown(self):
+        self.fp.status.update(state=1, deviceState=1)
+        o = self.run_cli("filament", "load")
+        r = self.run_cli("approve", o["request_id"], "--yes")
+        self.assertEqual(r["status"], "preflight_failed")
+        self.assertIn("printer_idle_or_paused", r["preflight"]["failed"])
+        c = self.run_cli("printer", "cooldown")
+        self.assertEqual(c["status"], "awaiting_owner")
+        self.assertEqual(self.run_cli("approve", c["request_id"], "--yes")["status"], "ok")
+        self.assertEqual(self.gsent(), ["M104 S0", "M140 S0"])

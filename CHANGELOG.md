@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0
+
+> Not yet hardware-verified on a CR-10 SE beyond read-only data and one owner-approved retract (see docs/PROTOCOL.md).
+
+- New gated filament commands: `filament extrude --mm N`, `filament retract --mm N`, `filament load`, `filament unload`.
+  Each preheats to `FILAMENT_PREHEAT_C` (300 C by default, max 320), waits until the nozzle is within
+  `FILAMENT_TEMP_TOL_C` (3), soaks `FILAMENT_SOAK_S` (5 s), sends `M83`, `G1 E… F…` in pieces of 45 mm or less (Klipper's
+  50 mm extrude-only limit), then `M82`, waits for the move and sets the nozzle to 0 (`--hold` keeps it hot). Any error
+  or heat timeout (`FILAMENT_HEAT_TIMEOUT_S`, 600) turns the nozzle off and writes an owner_inbox packet. Limits:
+  100 mm per extrude or retract, 120 mm per load or unload, 0.5-10 mm/s. Refused while printing unless paused; preflight
+  also checks the preheat against the printer's max.
+- New gated `printer cooldown` (nozzle and bed to 0).
+- The result includes a temperature timeline, the time to reach temperature and every gcode sent, with timings.
+
 ## 1.1.0
 
 > Not yet hardware-verified on a CR-10 SE for uploads and physical actions. Read-only live data was checked on a

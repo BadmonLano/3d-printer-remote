@@ -1,5 +1,5 @@
 ---
-version: 1.1.0
+version: 1.2.0
 name: printer-remote
 description: Drive Creality Print 7.2 and a Creality CR-10 SE from the `3D Printer Remote` CLI (not yet hardware-verified on a CR-10 SE). Detect the slicer, list/clone/edit presets, slice 3MF/STL, check bed fit, read LIVE printer data, upload over LAN, run a print queue with filament swaps, track history/cost/filament/maintenance, inspect gcode, take camera snapshots, check the bed and watch prints. Use when the owner says slice this, print this, what's the printer doing, printer status, temps, progress, is the bed clear, watch the print, queue these, how much filament is left, pause/cancel the print, heat the bed, move the head, change print settings, will this fit the bed, or a packet named "printer_remote - ..." lands in owner_inbox/.
 ---
@@ -28,7 +28,8 @@ Every command prints JSON. Read `status` (`ok`, `error`, `skipped`, `awaiting_ow
 - `watch --once`, or `watch --interval 120 --stop-when-idle`: alerts, first-layer photo, ETA, the done photo and a "clear the bed" reminder.
 
 ## Physical commands (owner yes, then preflight)
-- `printer start <file> [--color white --material PETG]`, `printer pause|resume|cancel|home`, `printer heat --nozzle 240 --bed 75`, `printer move --x 110 --y 110` or `--relative --z 10`, `printer fan --pct 50`, any non-read-only `printer gcode`, `queue next`.
+- `printer start <file> [--color white --material PETG]`, `printer pause|resume|cancel|home`, `printer heat --nozzle 240 --bed 75`, `printer move --x 110 --y 110` or `--relative --z 10`, `printer fan --pct 50`, `printer cooldown`, `filament extrude --mm 20` / `filament retract --mm 10` / `filament load` / `filament unload` (each preheats to 300 C, waits until the nozzle is within 3 C, moves the filament slowly, then turns the nozzle off; `--hold` keeps it hot), any non-read-only `printer gcode`, `queue next`.
+- A filament move takes minutes (heating from room temperature to 300 C). Tell the owner before you start, and report the result's `timeline`, `reached_temp_after_s` and `nozzle_target_set_to`.
 1. The first call returns `awaiting_owner`, a `request_id` and a `summary`. Show the owner the summary (and the snapshot for a start), then ask: "Start it? yes or no". Always say "Check the bed is clear" before a start.
 2. When the owner answers, run `approve <request_id> --yes --by owner_chat --quote "<their exact words>"`, or `--no`.
 3. On yes, preflight runs automatically. `ok` means it ran. `preflight_failed` means nothing was sent: tell the owner which checks failed (`preflight.failed`) and what to fix. Mention any `flagged` checks.

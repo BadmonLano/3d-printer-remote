@@ -9,7 +9,8 @@ One consolidated CLI. Every subcommand prints ONE JSON object on stdout:
 Free (no confirm): detect, presets, slice, open, split-check, gcode inspect, queue/history/filament/maint/library,
                    recommend, plates, timelapse, health, printer discover/probe/status/stream/latest/info/files/...,
                    printer upload, read-only gcode queries, camera, watch (observe + alert).
-Gated (owner yes in chat): printer start / pause / resume / cancel / heat / home / move / fan / non-read-only gcode.
+Gated (owner yes in chat): printer start / pause / resume / cancel / heat / home / move / fan / cooldown,
+    filament extrude / retract / load / unload (300 C preheat by default), non-read-only gcode.
     First call -> request + summary, status "awaiting_owner". The owner answers YES/NO in chat.
     `approve <request_id> --yes|--no` records it; on yes an automatic preflight runs and the action executes
     only if preflight passes. Agents pass along only the owner's own answer, never their own.
@@ -43,7 +44,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BOT = "printer_remote"
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -52,7 +53,8 @@ PRESET_TYPES = ("machine", "process", "filament")
 DEFAULT_PRINTER = "Creality CR-10 SE 0.4 nozzle"
 DEFAULT_PROCESS = "0.20mm Standard @Creality CR-10 SE 0.4 nozzle"
 DEFAULT_FILAMENT = "CR-PETG @Creality CR-10 SE 0.4 nozzle"
-GATED_ACTIONS = ("start", "pause", "resume", "cancel", "heat", "home", "fan", "move")
+GATED_ACTIONS = ("start", "pause", "resume", "cancel", "heat", "home", "fan", "move", "cooldown")
+FILAMENT_MOVES = ("extrude", "retract", "load", "unload")
 
 # friendly override name -> Creality Print key
 OVERRIDE_ALIASES = {
@@ -1229,6 +1231,8 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
             raise Fail("one gcode line at a time (max 120 chars)")
     if action == "move":
         params.update(move_params(a))
+    if action in FILAMENT_MOVES:
+        params.update(filament_move_params(action, a))
     if extra and extra.get("_params"):
         params.update(extra.pop("_params"))
     rid = f"r{ts_compact()}_{secrets.token_hex(2)}"
@@ -1253,6 +1257,10 @@ def request_gated(action: str, a, out, reason: str = "", extra: dict | None = No
         summary += f" ({params['cmd']})"
     if action == "fan":
         summary += f" ({params['pct']}%)"
+    if action in FILAMENT_MOVES:
+        summary = f"Filament {action} ({params['desc']})"
+    if action == "cooldown":
+        summary += " (nozzle and bed targets to 0)"
     attach: dict = dict(extra or {})
     photo = None
     if action in ("start", "resume") and camera_enabled():
@@ -1302,8 +1310,11 @@ def preflight(action: str, params: dict) -> dict:
         if action in ("start", "home"):
             _check(checks, "printer_idle", bool(st.get("idle", not printing and not paused)) and not printing and not paused,
                    f"state {st.get('state')}, deviceState {st.get('device_state')}")
-        elif action == "move":
+        elif action == "move" or action in FILAMENT_MOVES:
             _check(checks, "printer_idle_or_paused", (not printing) or paused, f"state {st.get('state')}")
+            if action in FILAMENT_MOVES:
+                mx = (st.get("nozzle") or {}).get("max") or 320
+                _check(checks, "preheat_within_printer_max", params["temp"] <= mx, f"{params['temp']} C vs printer max {mx} C")
         elif action == "pause":
             _check(checks, "printer_printing", printing and not paused, f"state {st.get('state')}")
         elif action == "resume":
@@ -1311,7 +1322,7 @@ def preflight(action: str, params: dict) -> dict:
         elif action == "cancel":
             _check(checks, "job_running", printing or paused, f"state {st.get('state')}")
         _check(checks, "no_printer_error", not st.get("has_error"), f"error {st.get('error', {}).get('raw')}",
-               blocking=action not in ("pause", "cancel"))
+               blocking=action not in ("pause", "cancel", "cooldown"))
         nz, bd = st.get("nozzle") or {}, st.get("bed") or {}
         sane = True
         notes = []
@@ -1328,7 +1339,7 @@ def preflight(action: str, params: dict) -> dict:
                 sane = False
             else:
                 notes.append(f"{nm} {act}/{tgt} C")
-        _check(checks, "temps_sane", sane, "; ".join(notes), blocking=action not in ("pause", "cancel"))
+        _check(checks, "temps_sane", sane, "; ".join(notes), blocking=action not in ("pause", "cancel", "cooldown"))
     if action == "start":
         try:
             names = [str(f.get("name") or f.get("fileName") or f.get("filename") or "") if isinstance(f, dict) else str(f)
@@ -1442,6 +1453,146 @@ def move_params(a) -> dict:
             "desc": ("relative " if a.relative else "to ") + g1[3:]}
 
 
+FILAMENT_CHUNK_MM = 45.0  # Klipper's default max_extrude_only_distance is 50 mm per move
+
+
+def filament_move_params(action: str, a) -> dict:
+    """Preheat (default 300 C, the owner's way: melts hardened filament in the tip), then move filament."""
+    temp = float(getattr(a, "temp", None) or env_float("FILAMENT_PREHEAT_C", 300))
+    tmax = min(env_float("FILAMENT_MAX_C", 320), 320)
+    if not (180 <= temp <= tmax):
+        raise Fail(f"preheat must be 180-{tmax:.0f} C")
+    mm = getattr(a, "mm", None)
+    if action == "extrude":
+        if mm is None:
+            raise Fail("extrude needs --mm")
+        cap = env_float("FILAMENT_MAX_EXTRUDE_MM", 100)
+        moves = [abs(mm)]
+    elif action == "retract":
+        if mm is None:
+            raise Fail("retract needs --mm")
+        cap = env_float("FILAMENT_MAX_RETRACT_MM", 100)
+        moves = [-abs(mm)]
+    elif action == "load":
+        mm = mm if mm is not None else env_float("FILAMENT_LOAD_MM", 60)
+        purge = env_float("FILAMENT_PURGE_MM", 15)
+        cap = env_float("FILAMENT_MAX_LOAD_MM", 120)
+        moves = [abs(mm), purge]
+    else:  # unload: small purge to soften the tip, then pull the filament out
+        mm = mm if mm is not None else env_float("FILAMENT_UNLOAD_MM", 80)
+        purge = env_float("FILAMENT_UNLOAD_PURGE_MM", 5)
+        cap = env_float("FILAMENT_MAX_UNLOAD_MM", 120)
+        moves = [purge, -abs(mm)]
+    total = sum(abs(m) for m in moves)
+    if not (0 < abs(mm) and total <= cap):
+        raise Fail(f"{action} is limited to {cap:.0f} mm per command (asked {total:g} mm)")
+    speed = float(getattr(a, "speed", None) or env_float("FILAMENT_SPEED_MM_S", 3))
+    if not (0.5 <= speed <= 10):
+        raise Fail("--speed must be 0.5-10 mm/s")
+    chunks = []
+    for m in moves:
+        left = abs(m)
+        while left > 1e-6:
+            c = min(left, FILAMENT_CHUNK_MM)
+            chunks.append(round(c if m > 0 else -c, 3))
+            left -= c
+    hold = bool(getattr(a, "hold", False))
+    desc = (f"heat nozzle to {temp:g} C, " + ", ".join(f"{'push' if m > 0 else 'pull'} {abs(m):g} mm" for m in moves)
+            + f" at {speed:g} mm/s, then " + ("hold the nozzle at temperature" if hold else "nozzle off"))
+    return {"temp": temp, "moves": moves, "chunks": chunks, "speed_mm_s": speed, "hold": hold, "desc": desc}
+
+
+def run_filament_move(cfg: dict, action: str, params: dict) -> dict:
+    """One websocket session: preheat, wait within tolerance, M83 + G1 E moves + M82, wait, then nozzle off
+    (unless hold). The nozzle is always turned off on any failure."""
+    tol = env_float("FILAMENT_TEMP_TOL_C", 3)
+    timeout = env_float("FILAMENT_HEAT_TIMEOUT_S", 600)
+    soak = env_float("FILAMENT_SOAK_S", 5)
+    t0 = time.monotonic()
+    seen: dict = {}
+    timeline: list = []
+    sent: list = []
+    last_log = [-99.0]
+    ws = WS(cfg["ip"], cfg["ws_port"], timeout=5)
+
+    def send(cmd: str) -> None:
+        ws.send(json.dumps({"method": "set", "params": {"gcodeCmd": cmd}}))
+        sent.append({"t_s": round(time.monotonic() - t0, 1), "gcode": cmd})
+
+    def pump(seconds: float, until=None) -> bool:
+        end = time.monotonic() + seconds
+        next_req = time.monotonic() + 2
+        while time.monotonic() < end:
+            if time.monotonic() >= next_req:
+                ws.send(json.dumps({"method": "get", "params": {"ReqPrinterPara": 1}}))
+                next_req = time.monotonic() + 2
+            raw = ws.recv(max(0.1, min(1.0, end - time.monotonic())))
+            if raw is None:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("ModeCode") == "heart_beat":
+                ws.send("ok")
+                continue
+            if not isinstance(d, dict):
+                continue
+            seen.update(d)
+            el = time.monotonic() - t0
+            if el - last_log[0] >= 2 and "nozzleTemp" in seen:
+                last_log[0] = el
+                n = normalize_status(seen)
+                timeline.append({"t_s": round(el, 1), "at": ts_human(), "nozzle": n["nozzle"]["actual"],
+                                 "target": n["nozzle"]["target"], "state": n["state"]})
+                if n["has_error"]:
+                    raise Fail(f"printer reported an error: {n['error']['raw']}")
+                if n["printing"] and not n["paused"]:
+                    raise Fail("printer started printing; stopping")
+            if until and until(seen):
+                return True
+        return False
+
+    ok = False
+    result: dict = {"action": action, "temp": params["temp"], "moves": params["moves"]}
+    try:
+        ws.send(json.dumps({"method": "get", "params": {"ReqPrinterPara": 1}}))
+        pump(1.5)
+        send(f"M104 S{int(params['temp'])}")
+        hot = pump(timeout, until=lambda v: (_f(v.get("nozzleTemp")) or 0) >= params["temp"] - tol)
+        if not hot:
+            raise Fail(f"nozzle did not reach {params['temp']:g} C within {timeout:.0f} s")
+        result["reached_temp_after_s"] = round(time.monotonic() - t0, 1)
+        pump(soak)
+        send("M83")
+        for c in params["chunks"]:
+            send(f"G1 E{c:g} F{int(params['speed_mm_s'] * 60)}")
+        send("M82")
+        pump(sum(abs(c) for c in params["chunks"]) / params["speed_mm_s"] + 2)
+        ok = True
+        result["moved_mm"] = sum(params["moves"])
+    finally:
+        try:
+            if not (ok and params.get("hold")):
+                send("M104 S0")
+                result["nozzle_target_set_to"] = 0
+                try:
+                    pump(3)
+                except Fail:
+                    pass
+        except OSError:
+            # socket gone: one more try on a fresh connection
+            ws_exchange(cfg, [{"method": "set", "params": {"gcodeCmd": "M104 S0"}}], wait=1)
+            sent.append({"t_s": round(time.monotonic() - t0, 1), "gcode": "M104 S0 (reconnect)"})
+            result["nozzle_target_set_to"] = 0
+        ws.close()
+        result.update(sent=sent, timeline=timeline, total_s=round(time.monotonic() - t0, 1), completed=ok)
+        if not ok:
+            write_packet(f"filament {action} stopped", "result", f"Filament {action} stopped; nozzle set to 0.",
+                         result, "error", priority="high")
+    return result
+
+
 def execute_physical(action: str, params: dict) -> dict:
     if not env_bool("PHYSICAL_ACTIONS_ENABLED", True):  # kill switch also covers auto-pause and every caller
         raise Fail("physical actions are switched off (PHYSICAL_ACTIONS_ENABLED=false)")
@@ -1468,6 +1619,12 @@ def execute_physical(action: str, params: dict) -> dict:
             msgs.append({"method": "set", "params": {"gcodeCmd": f"M140 S{int(params['bed'])}"}})
         reply = ws_exchange(cfg, msgs, wait=2)
         return {"sent": [m["params"] for m in msgs], "printer_reply": {k: reply.get(k) for k in ("err",) if k in reply}}
+    if action == "cooldown":
+        msgs = [{"method": "set", "params": {"gcodeCmd": g}} for g in ("M104 S0", "M140 S0")]
+        reply = ws_exchange(cfg, msgs, wait=2)
+        return {"sent": ["M104 S0", "M140 S0"], "printer_reply": {k: reply.get(k) for k in ("err",) if k in reply}}
+    if action in FILAMENT_MOVES:
+        return run_filament_move(cfg, action, params)
     if action == "move":
         st = printer_status(cfg)
         if st.get("printing") and not st.get("paused"):
@@ -2048,6 +2205,8 @@ def inventory_check(material: str | None, color: str | None, grams: float | None
 
 
 def cmd_filament(a, out):
+    if a.filament_cmd in FILAMENT_MOVES:
+        return request_gated(a.filament_cmd, a, out)
     inv = load_store("inventory", [])
     c = a.filament_cmd
     if c == "list":
@@ -2711,6 +2870,7 @@ def build_parser() -> argparse.ArgumentParser:
     for n in ("discover", "probe", "status", "latest", "pause", "resume", "cancel", "home", "info",
               "files", "history", "mesh", "objects", "timelapses", "config", "ota", "materials"):
         ps.add_parser(n)
+    ps.add_parser("cooldown", help="gated: nozzle and bed targets to 0")
     x = ps.add_parser("move", help="gated: jog the head (absolute within the bed, or --relative up to 50 mm)")
     for ax in ("x", "y", "z"):
         x.add_argument(f"--{ax}", type=float)
@@ -2792,6 +2952,15 @@ def build_parser() -> argparse.ArgumentParser:
         y.add_argument("--grams", type=float, required=True)
     y = fp.add_parser("archive")
     y.add_argument("id")
+    for n, h in (("extrude", "gated: preheat (300 C default) then push filament"),
+                 ("retract", "gated: preheat then pull filament back"),
+                 ("load", "gated: preheat, feed and purge (color swap)"),
+                 ("unload", "gated: preheat, small purge, pull filament out (color swap)")):
+        y = fp.add_parser(n, help=h)
+        y.add_argument("--mm", type=float, help="filament length (extrude/retract required)")
+        y.add_argument("--speed", type=float, help="mm/s (default 3)")
+        y.add_argument("--temp", type=float, help="preheat C (default FILAMENT_PREHEAT_C=300, max 320)")
+        y.add_argument("--hold", action="store_true", help="keep the nozzle hot afterwards (default: nozzle off)")
     y = fp.add_parser("check")
     y.add_argument("--material")
     y.add_argument("--color")
